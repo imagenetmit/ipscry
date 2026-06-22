@@ -1,0 +1,14 @@
+# Build output
+/dist/
+*.exe
+*.syso
+
+# Scan artifacts
+/ipscry-output/
+scan.json
+scan.csv
+scan.log
+
+# Go
+*.test
+*.out
