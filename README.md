@@ -1,7 +1,7 @@
 # Ipscry
 
 [![CI](https://github.com/imagenetmit/ipscry/actions/workflows/ci.yml/badge.svg)](https://github.com/imagenetmit/ipscry/actions/workflows/ci.yml)
-[![Go Reference](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Go Reference](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Platform](https://img.shields.io/badge/platform-windows-0078D6?logo=windows&logoColor=white)](#)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -41,7 +41,7 @@ auditable JSON, CSV, and log artifacts.
 
 ## Build
 
-Install Go 1.22 or newer, then build a normal uncompressed Windows executable:
+Install Go 1.26 or newer, then build a normal uncompressed Windows executable:
 
 ```powershell
 go build -trimpath -o ipscry.exe .

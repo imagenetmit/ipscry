@@ -11,7 +11,7 @@ By participating in this project you agree to abide by the
 
 ## Prerequisites
 
-- [Go 1.22](https://go.dev/dl/) or newer.
+- [Go 1.26](https://go.dev/dl/) or newer.
 - Git.
 - (Optional, Windows) `windres` for embedding version metadata and `signtool`
   for Authenticode signing.
