@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: true
+
+      - name: Test
+        shell: pwsh
+        run: go test ./... -count=1
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "dev-${{ github.sha }}" }
+          ./build-windows.ps1 -Version $version
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item dist/ipscry.exe dist/package/ipscry.exe
+          Copy-Item README.md,LICENSE,SECURITY.md,CHANGELOG.md dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath dist/ipscry-windows-amd64.zip -Force
+          Get-FileHash dist/ipscry-windows-amd64.zip -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  ipscry-windows-amd64.zip" } |
+            Set-Content dist/ipscry-windows-amd64.zip.sha256
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          files: |
+            dist/ipscry.exe
+            dist/ipscry-windows-amd64.zip
+            dist/ipscry-windows-amd64.zip.sha256
+          generate_release_notes: true

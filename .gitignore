@@ -12,3 +12,6 @@ scan.log
 # Go
 *.test
 *.out
+
+# Local Cursor state
+.cursor/hooks/state/

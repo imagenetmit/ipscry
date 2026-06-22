@@ -1026,7 +1026,7 @@ func buildSMB2SessionSetup() []byte {
 	const securityBufferOffset = 64 + 24 // header + fixed session-setup body
 	body := make([]byte, 24)
 	binary.LittleEndian.PutUint16(body[0:2], 25) // StructureSize (24 + 1 convention)
-	body[3] = 1                                   // SecurityMode: signing enabled
+	body[3] = 1                                  // SecurityMode: signing enabled
 	binary.LittleEndian.PutUint16(body[12:14], securityBufferOffset)
 	binary.LittleEndian.PutUint16(body[14:16], uint16(len(ntlmType1)))
 	pkt := append(smb2Header(0x0001, 1), body...) // SESSION_SETUP, message id 1

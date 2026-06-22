@@ -386,7 +386,7 @@ func TestParseNBNSName(t *testing.T) {
 		suffix byte
 		flags  uint16
 	}{
-		{"WORKGROUP", 0x00, 0x8000},  // group; must be skipped
+		{"WORKGROUP", 0x00, 0x8000},    // group; must be skipped
 		{"DESKTOP-AB12", 0x20, 0x0400}, // unique server service; fallback
 		{"DESKTOP-AB12", 0x00, 0x0400}, // unique workstation; preferred
 	})

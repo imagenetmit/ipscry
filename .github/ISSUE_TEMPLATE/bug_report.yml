@@ -1,0 +1,60 @@
+name: Bug Report
+description: Report a reproducible problem in Ipscry.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. For security-sensitive issues,
+        please follow SECURITY.md instead of opening a public issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: Ipscry...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest command or scenario that reproduces the issue.
+      placeholder: |
+        1. Run `ipscry scan ...`
+        2. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Ipscry version
+      placeholder: Output of `ipscry version`
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Windows 11 23H2, Windows Server 2022, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or artifacts
+      description: Paste relevant sanitized output. Remove private IPs, hostnames, and identifiers if needed.
+      render: text

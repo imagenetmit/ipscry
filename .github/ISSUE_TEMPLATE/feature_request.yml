@@ -1,0 +1,37 @@
+name: Feature Request
+description: Suggest an improvement or new capability.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep requests aligned with Ipscry's intended use: authorized local
+        network inventory with a conservative AV/EDR posture.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow, limitation, or gap would this solve?
+      placeholder: I need to...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Mention other approaches or workarounds.
+  - type: checkboxes
+    id: posture
+    attributes:
+      label: Project posture
+      options:
+        - label: This request does not require raw sockets, credential submission, exploitation, persistence, or runtime downloads in the default path.
+          required: true
