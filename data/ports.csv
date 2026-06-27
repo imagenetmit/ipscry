@@ -1,0 +1,93 @@
+port,service,vendors
+20,FTP (data),vsftpd; ProFTPD; FileZilla Server; IIS FTP
+21,FTP (control),vsftpd; ProFTPD; FileZilla Server; IIS FTP
+22,SSH,OpenSSH; Dropbear; Cisco IOS; Windows OpenSSH Server
+23,Telnet,Cisco IOS; legacy network devices; Windows Telnet Server
+25,SMTP,Postfix; Sendmail; Microsoft Exchange; Exim
+53,DNS,BIND; Microsoft DNS; dnsmasq; Unbound; PowerDNS
+67,DHCP,ISC DHCP; Windows Server DHCP; dnsmasq; Kea DHCP
+69,TFTP,Cisco devices; PXE boot servers; embedded firmware loaders
+80,HTTP,Apache httpd; nginx; Microsoft IIS; Caddy; Tomcat
+81,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+82,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+83,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+84,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+85,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+86,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+87,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+88,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+89,HTTP (alternate),Apache httpd; nginx; IIS; alternate web bindings
+110,POP3,Dovecot; Microsoft Exchange; Courier; Zimbra
+111,rpcbind,Linux rpcbind; NFS client/server stacks
+123,NTP,ntpd; chrony; Windows Time Service; Cisco IOS
+135,MS RPC,Microsoft Windows RPC Endpoint Mapper
+137,NetBIOS name service,Microsoft Windows; Samba
+138,NetBIOS datagram,Microsoft Windows; Samba
+139,NetBIOS session,Microsoft Windows; Samba (legacy SMB over NetBIOS)
+143,IMAP,Dovecot; Microsoft Exchange; Cyrus IMAP; Zimbra
+161,SNMP,Net-SNMP; Cisco IOS; switches; printers; UPS devices
+162,SNMP trap,Net-SNMP; Nagios; PRTG; monitoring collectors
+389,LDAP,Active Directory; OpenLDAP; 389 Directory Server; FreeIPA
+443,HTTPS,Apache httpd; nginx; Microsoft IIS; Caddy; load balancers
+444,HTTPS (alternate),VMware products; SSL VPN appliances; alternate HTTPS bindings
+445,SMB,Microsoft Windows; Samba
+514,Syslog,rsyslog; syslog-ng; Windows Event Forwarding; SIEM collectors
+515,LPD,CUPS; legacy line printers
+587,SMTP submission,Postfix; Microsoft Exchange; Exim; Google Workspace relay
+636,LDAPS,Active Directory; OpenLDAP; 389 Directory Server
+873,rsync,rsync daemon; backup appliances; NAS sync jobs
+989,FTPS (data),vsftpd; FileZilla Server; IIS FTP
+990,FTPS (control),vsftpd; FileZilla Server; IIS FTP
+1080,SOCKS proxy,Dante; Squid; SSH dynamic forwarding
+1194,OpenVPN,OpenVPN; OpenVPN Access Server; pfSense; OPNsense
+1433,Microsoft SQL Server,Microsoft SQL Server; Azure SQL Edge
+1521,Oracle Database,Oracle Database; Oracle Listener
+1723,PPTP,Microsoft RRAS; legacy VPN appliances
+2049,NFS,Linux NFS; FreeBSD NFS; NAS appliances
+2222,SSH (alternate),DirectAdmin; cPanel; alternate OpenSSH bindings
+2375,Docker API,Docker Engine; containerd (legacy unencrypted API)
+2376,Docker API (TLS),Docker Engine; containerd (TLS API)
+3000,HTTP (dev),Create React App; Next.js dev server; Node.js; Grafana
+3001,HTTP (dev),Node.js dev servers; alternate frontend tooling
+3128,HTTP proxy,Squid; Polipo; corporate proxy appliances
+3306,MySQL,MySQL; MariaDB; Percona Server; Amazon RDS MySQL
+3389,RDP,Microsoft Remote Desktop Services; Windows Pro/Server
+3690,Subversion,Apache Subversion (svnserve)
+4000,HTTP (dev),Flask dev server; NoMachine; generic dev web servers
+4443,HTTPS (alternate),VMware vSphere; pfSense; QNAP; alternate admin HTTPS
+4444,Metasploit listener,Metasploit Framework; some Java app servers
+5000,HTTP,Flask (default); Synology DSM; UPnP; macOS AirPlay Receiver
+5001,HTTPS,Synology DSM; alternate HTTPS admin interfaces
+5060,SIP,Asterisk; FreePBX; 3CX; Cisco IP phones; Avaya
+5061,SIP (TLS),Asterisk; FreePBX; 3CX; Cisco secure SIP
+5432,PostgreSQL,PostgreSQL; Amazon RDS PostgreSQL; Azure Database for PostgreSQL
+5443,HTTPS (alternate),QNAP; VMware; alternate NAS/admin HTTPS
+5500,HTTP (dev),VS Code Live Server; dev static servers
+5601,Kibana,Elastic Kibana; Elastic Cloud deployments
+5672,AMQP,RabbitMQ; Amazon MQ; Azure Service Bus (AMQP)
+5900,VNC,RealVNC; TightVNC; TigerVNC; macOS Screen Sharing
+5985,WinRM,Microsoft Windows Remote Management (HTTP)
+5986,WinRM (HTTPS),Microsoft Windows Remote Management (HTTPS)
+6379,Redis,Redis; Amazon ElastiCache Redis; Azure Cache for Redis
+6443,Kubernetes API,kube-apiserver; OpenShift; Rancher; managed Kubernetes control planes
+7001,WebLogic,Oracle WebLogic Server
+7443,HTTPS (alternate),IBM WebSphere; alternate enterprise HTTPS admin
+8000,HTTP,Django dev server; Python http.server; Splunk (optional); HTTP alternate
+8008,HTTP (alternate),HTTP alternate bindings; some Tomcat/Jenkins installs
+8080,HTTP proxy / app server,Apache Tomcat; Jenkins; JBoss/WildFly; HTTP proxies
+8081,HTTP (alternate),Apache Tomcat (secondary connector); app server admin
+8082,HTTP (alternate),secondary app servers; dev/test HTTP services
+8181,HTTP (alternate),Apache Tomcat admin; GlassFish; alternate admin HTTP
+8443,HTTPS (alternate),Apache Tomcat SSL; UniFi Network Application; admin HTTPS panels
+8888,HTTP (alternate),Jupyter Notebook; HTTP alternate bindings; NAS admin UIs
+9000,HTTP,SonarQube; PHP-FPM status; Portainer; ClickHouse HTTP interface
+9001,HTTP (alternate),Portainer agent; alternate dev/service HTTP
+9090,HTTP,Prometheus; Red Hat Cockpit; monitoring dashboards
+9100,Metrics / JetDirect,Prometheus Node Exporter; HP JetDirect; hardware metrics
+9200,Elasticsearch,Elasticsearch REST API; Elastic Cloud
+9300,Elasticsearch transport,Elasticsearch cluster transport; Elastic Cloud
+9443,HTTPS (alternate),IBM WebSphere; enterprise admin HTTPS panels
+10000,HTTPS,Webmin; Usermin
+11211,Memcached,Memcached; Amazon ElastiCache Memcached
+27017,MongoDB,MongoDB; MongoDB Atlas; DocumentDB-compatible deployments
+28017,MongoDB HTTP,MongoDB legacy web status interface (pre-3.6)
