@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -92,6 +92,42 @@ func TestNormalizeScanArgsAllowsFlagsAfterTarget(t *testing.T) {
 	}
 }
 
+func TestNormalizeScanArgsShortFlags(t *testing.T) {
+	flags, positional, err := normalizeScanArgs([]string{"192.168.1.0/24", "-t", "500ms", "-l", "-c", "64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(positional) != 1 || positional[0] != "192.168.1.0/24" {
+		t.Fatalf("positional=%#v", positional)
+	}
+	want := []string{"--timeout", "500ms", "--local", "--concurrency", "64"}
+	for i := range want {
+		if flags[i] != want[i] {
+			t.Fatalf("flags[%d]=%q, want %q", i, flags[i], want[i])
+		}
+	}
+}
+
+func TestParseScanArgsDefaultConcurrency(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Concurrency != 1024 {
+		t.Fatalf("concurrency=%d, want 1024", cfg.Concurrency)
+	}
+}
+
+func TestParseScanArgsShortConcurrency(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "-c", "64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Concurrency != 64 {
+		t.Fatalf("concurrency=%d, want 64", cfg.Concurrency)
+	}
+}
+
 func TestExpandCIDRSkipsNetworkAndBroadcast(t *testing.T) {
 	ips, err := expandCIDR("192.168.1.0/30")
 	if err != nil {
@@ -157,6 +193,91 @@ func TestProbeHTTPReturnsMetadata(t *testing.T) {
 	}
 	if pr.HTTPTitle != "Lab Device" {
 		t.Fatalf("title=%q, want Lab Device", pr.HTTPTitle)
+	}
+}
+
+func TestParseScanArgsNoOutputPathsByDefault(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.JSONPath != "" || cfg.CSVPath != "" || cfg.LogPath != "" {
+		t.Fatalf("json=%q csv=%q log=%q, want all empty", cfg.JSONPath, cfg.CSVPath, cfg.LogPath)
+	}
+}
+
+func TestMergeARPCacheHosts(t *testing.T) {
+	_, ipNet, err := net.ParseCIDR("192.168.1.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := map[string]struct{}{"192.168.1.10": {}}
+	entries := []arpCacheEntry{
+		{IP: "192.168.1.10", MAC: "aa:bb:cc:dd:ee:01", Kind: "dynamic"},
+		{IP: "192.168.1.20", MAC: "aa:bb:cc:dd:ee:02", Kind: "dynamic"},
+		{IP: "192.168.1.0", MAC: "aa:bb:cc:dd:ee:03", Kind: "dynamic"},
+		{IP: "10.0.0.5", MAC: "aa:bb:cc:dd:ee:04", Kind: "dynamic"},
+		{IP: "192.168.1.30", MAC: "00:00:00:00:00:00", Kind: "dynamic"},
+	}
+	got := mergeARPCacheHosts(live, entries, ipNet)
+	if len(got) != 1 || got[0].IP != "192.168.1.20" {
+		t.Fatalf("merge=%#v, want only 192.168.1.20", got)
+	}
+}
+
+func TestParseScanArgsARPCache(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ARPCache {
+		t.Fatal("expected arp-dead enabled")
+	}
+}
+
+func TestWriteJSONIncludesMAC(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scan.json")
+	report := scanReport{
+		Hosts: []hostResult{{
+			IP: "192.168.1.5", MAC: "aa:bb:cc:dd:ee:ff", MACVendor: "Acme, Inc", Guess: "windows",
+			OpenPorts: []portResult{{Port: 445, Service: "smb"}},
+		}},
+	}
+	if err := writeJSON(path, report, "dash"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, `"mac": "aa-bb-cc-dd-ee-ff"`) {
+		t.Fatalf("json missing formatted mac, got:\n%s", content)
+	}
+	if !strings.Contains(content, `"mac_vendor": "Acme, Inc"`) {
+		t.Fatalf("json missing mac_vendor, got:\n%s", content)
+	}
+}
+
+func TestWriteCSVIncludesMAC(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scan.csv")
+	report := scanReport{
+		Hosts: []hostResult{{
+			IP: "192.168.1.5", MAC: "aa:bb:cc:dd:ee:ff", MACVendor: "Acme, Inc", Guess: "windows",
+			OpenPorts: []portResult{{Port: 445, Service: "smb"}},
+		}},
+	}
+	if err := writeCSV(path, report, "none"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "aabbccddeeff") {
+		t.Fatalf("csv missing formatted mac, got:\n%s", data)
 	}
 }
 
@@ -285,8 +406,8 @@ func TestGuessDeviceBranches(t *testing.T) {
 		{"camera by port", []portResult{{Port: 554}}, "", "camera"},
 		{"camera by text", []portResult{{Port: 80, HTTPServer: "Hikvision-Webs"}}, "", "camera"},
 		{"windows", []portResult{{Port: 445}}, "", "windows"},
-		{"database", []portResult{{Port: 3306}}, "", "database"},
-		{"linux", []portResult{{Port: 22}}, "", "linux_or_network_appliance"},
+		{"database", []portResult{{Port: 3306}}, "", "db"},
+		{"linux", []portResult{{Port: 22}}, "", "linux/device"},
 		{"unknown", []portResult{{Port: 53}}, "", "unknown"},
 		{"network via snmp", []portResult{{Port: 22}}, "Cisco IOS Software, C3560", "network"},
 		{"printer via snmp", []portResult{{Port: 80}}, "HP LaserJet MFP", "printer"},
@@ -311,7 +432,7 @@ func TestWriteCSVContent(t *testing.T) {
 			OpenPorts: []portResult{{Port: 9100, Service: "jetdirect"}},
 		}},
 	}
-	if err := writeCSV(path, report); err != nil {
+	if err := writeCSV(path, report, "colon"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -320,8 +441,8 @@ func TestWriteCSVContent(t *testing.T) {
 	}
 	content := string(data)
 	for _, want := range []string{
-		"ip,hostname,guess,port,service",
-		"192.168.1.5,printer.local,printer,9100,jetdirect",
+		"ip,mac,mac_vendor,latency_ms,hostname,guess,status,arp_type,arp_ifindex,port,service",
+		"192.168.1.5,,,0,printer.local,printer,,,0,9100,jetdirect",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("csv missing %q; got:\n%s", want, content)
@@ -598,96 +719,243 @@ func TestSNMPGetLocalResponder(t *testing.T) {
 	}
 }
 
-func TestMACOUI(t *testing.T) {
-	cases := map[string]string{
-		"aa:bb:cc:dd:ee:ff": "AABBCC",
-		"AA-BB-CC-DD-EE-FF": "AABBCC",
-		"aabb.ccdd.eeff":    "AABBCC",
-		"aa:bb":             "", // too few hex digits
-		"":                  "",
+func TestFormatMAC(t *testing.T) {
+	mac := "00:0C:AA:BB:CC:DD"
+	cases := []struct {
+		format string
+		want   string
+	}{
+		{"colon", "00:0c:aa:bb:cc:dd"},
+		{"none", "000caabbccdd"},
+		{"dash", "00-0c-aa-bb-cc-dd"},
 	}
-	for in, want := range cases {
-		if got := macOUI(in); got != want {
-			t.Fatalf("macOUI(%q)=%q, want %q", in, got, want)
+	for _, tc := range cases {
+		if got := formatMAC(mac, tc.format); got != tc.want {
+			t.Fatalf("formatMAC(%q, %q)=%q, want %q", mac, tc.format, got, tc.want)
+		}
+	}
+	if got := formatMAC("", "colon"); got != "" {
+		t.Fatalf("empty MAC=%q", got)
+	}
+}
+
+func TestParseScanArgsMACFormat(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MACFormat != "colon" {
+		t.Fatalf("mac-format=%q, want colon", cfg.MACFormat)
+	}
+	if _, err := parseScanArgs([]string{"192.168.1.0/24", "-m", "dash"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseScanArgs([]string{"192.168.1.0/24", "--mac-format", "nope"}); err == nil {
+		t.Fatal("expected error for bad mac-format")
+	}
+}
+
+func TestParseScanArgsAIP(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "--aip"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AIP {
+		t.Fatal("expected aip enabled")
+	}
+	if !cfg.ARPCache {
+		t.Fatal("expected aip to enable arp-dead")
+	}
+}
+
+func TestPrintAIPTable(t *testing.T) {
+	report := scanReport{Hosts: []hostResult{
+		{
+			IP: "192.168.1.10", Hostname: "printer", MAC: "aa:bb:cc:dd:ee:01", MACVendor: "HP Inc",
+			LatencyMS: 3, OpenPorts: []portResult{{Port: 9100, Service: "jetdirect"}},
+		},
+		{
+			IP: "192.168.1.20", MAC: "aa:bb:cc:dd:ee:02", MACVendor: "Cisco Systems, Inc",
+			LatencyMS: -1, Status: "arp", ARPType: "dynamic",
+		},
+	}}
+	var buf bytes.Buffer
+	printAIPTable(&buf, report, "colon")
+	out := buf.String()
+	for _, want := range []string{"Stat", "Name", "IP", "Mfg", "MAC", "Ms"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in header, got:\n%s", want, out)
+		}
+	}
+	for _, want := range []string{"up", "printer", "192.168.1.10", "HP Inc", "aa:bb:cc:dd:ee:01", "3", "-", "192.168.1.20", "Cisco Sys"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, out)
 		}
 	}
 }
 
-func TestParseMACVendor(t *testing.T) {
-	if got := parseMACVendor([]byte(`[{"company":"Cisco Systems, Inc","country":"US"}]`)); got != "Cisco Systems, Inc" {
-		t.Fatalf("got %q", got)
-	}
-	if got := parseMACVendor([]byte(`[]`)); got != "" {
-		t.Fatalf("empty array should yield empty, got %q", got)
-	}
-	if got := parseMACVendor([]byte("not json")); got != "" {
-		t.Fatalf("invalid json should yield empty, got %q", got)
-	}
-}
-
-func TestMACVendorResolverDedupesByOUI(t *testing.T) {
-	var hits int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		_, _ = w.Write([]byte(`[{"company":"Acme Networks"}]`))
-	}))
-	defer server.Close()
-
-	r := newMACVendorResolver()
-	r.baseURL = server.URL + "/"
-	r.minGap = 0 // disable throttle delay for the test
-
-	v1 := r.lookup(context.Background(), "aa:bb:cc:11:22:33")
-	v2 := r.lookup(context.Background(), "AA-BB-CC-44-55-66") // same OUI, different NIC
-	if v1 != "Acme Networks" || v2 != "Acme Networks" {
-		t.Fatalf("v1=%q v2=%q", v1, v2)
-	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
-		t.Fatalf("api hits=%d, want 1 (deduped by OUI)", got)
-	}
-}
-
-func TestMACVendorResolverNoMatch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent) // 204 = no match
-	}))
-	defer server.Close()
-
-	r := newMACVendorResolver()
-	r.baseURL = server.URL + "/"
-	r.minGap = 0
-	if v := r.lookup(context.Background(), "de:ad:be:ef:00:01"); v != "" {
-		t.Fatalf("expected empty for 204, got %q", v)
+func TestPrintTableARPColumn(t *testing.T) {
+	report := scanReport{Hosts: []hostResult{{
+		IP: "192.168.1.20", MAC: "aa:bb:cc:dd:ee:ff", Guess: "offline", Status: "arp",
+		ARPType: "dynamic", ARPIfIndex: 7, LatencyMS: -1,
+	}}}
+	var buf bytes.Buffer
+	printTable(&buf, report, "colon")
+	out := buf.String()
+	for _, want := range []string{"Stat", "State", "Alias", "Index", "Stale", "arp", "-"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, out)
+		}
 	}
 }
 
 func TestPrintTableVendorColumn(t *testing.T) {
 	withVendor := scanReport{Hosts: []hostResult{{
-		IP: "192.168.1.5", Hostname: "pc", MACVendor: "Acme, Inc", Guess: "windows",
+		IP: "192.168.1.5", Hostname: "pc", MAC: "aa:bb:cc:dd:ee:ff", MACVendor: "Acme, Inc", Guess: "windows",
+		LatencyMS: 2, ARPType: "dynamic", ARPIfIndex: 4, ARPIfAlias: "Ethernet",
 		OpenPorts: []portResult{{Port: 445, Service: "smb"}},
 	}}}
 	var buf bytes.Buffer
-	printTable(&buf, withVendor)
+	printTable(&buf, withVendor, "colon")
 	out := buf.String()
-	if !strings.Contains(out, "Vendor") || !strings.Contains(out, "Acme, Inc") {
-		t.Fatalf("expected Vendor column, got:\n%s", out)
+	idxMAC := strings.Index(out, "MAC")
+	if idxMAC < 0 {
+		t.Fatalf("expected MAC column, got:\n%s", out)
+	}
+	idxIP := strings.Index(out, "IP")
+	if idxIP < 0 || idxIP > idxMAC {
+		t.Fatalf("expected IP before MAC, got:\n%s", out)
+	}
+	for _, want := range []string{"ms", "2", "Mfg", "Acme", "Reachable", "Ethernet", "4", "445"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, out)
+		}
 	}
 
-	// No vendor data anywhere -> column is omitted.
 	noVendor := scanReport{Hosts: []hostResult{{
-		IP: "192.168.1.5", Hostname: "pc", Guess: "windows",
+		IP: "192.168.1.5", Hostname: "pc", MAC: "aa:bb:cc:dd:ee:ff", Guess: "windows", LatencyMS: 4,
 		OpenPorts: []portResult{{Port: 445, Service: "smb"}},
 	}}}
 	buf.Reset()
-	printTable(&buf, noVendor)
-	if strings.Contains(buf.String(), "Vendor") {
-		t.Fatalf("did not expect Vendor column, got:\n%s", buf.String())
+	printTable(&buf, noVendor, "none")
+	out = buf.String()
+	if !strings.Contains(out, "MAC") || !strings.Contains(out, "aabbccddeeff") {
+		t.Fatalf("expected MAC column with no separator, got:\n%s", out)
+	}
+	if strings.Contains(out, "Mfg") {
+		t.Fatalf("did not expect Vendor column, got:\n%s", out)
+	}
+}
+
+func TestFormatDisplayCells(t *testing.T) {
+	if got := formatPortsDisplay([]portResult{{Port: 80, Service: "http"}, {Port: 443, Service: "https"}}); got != "80,443" {
+		t.Fatalf("ports=%q", got)
+	}
+	if got := formatGuessDisplay("linux/device"); got != "linux/dev" {
+		t.Fatalf("guess=%q", got)
+	}
+	if got := formatStatusDisplay("live"); got != "up" {
+		t.Fatalf("status=%q", got)
+	}
+	if got := formatVendorDisplay("Cisco Systems, Inc"); got != "Cisco Sys" {
+		t.Fatalf("vendor=%q", got)
+	}
+}
+
+func TestFormatARPInfo(t *testing.T) {
+	got := formatARPState(hostResult{ARPType: "static", ARPIfIndex: 3, ARPIfAlias: "Ethernet"})
+	if got != "Permanent" {
+		t.Fatalf("state=%q", got)
+	}
+	if formatARPAlias(hostResult{ARPIfAlias: "Ethernet"}) != "Ethernet" {
+		t.Fatal("alias mismatch")
+	}
+	if formatARPIndex(hostResult{ARPIfIndex: 3}) != "3" {
+		t.Fatal("index mismatch")
+	}
+	if formatARPInfo(hostResult{}) != "-" {
+		t.Fatal("expected dash for missing arp info")
+	}
+}
+
+func TestFormatARPNeighborDisplayDead(t *testing.T) {
+	if formatARPState(hostResult{Status: "dead", ARPType: "dynamic"}) != "Unreachable" {
+		t.Fatal("expected Unreachable state")
+	}
+	got := formatARPNeighborDisplay(hostResult{
+		Status: "dead", ARPType: "dynamic", ARPIfIndex: 4, ARPIfAlias: "Wi-Fi",
+	})
+	if got != "Unreachable Wi-Fi 4" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestHostWasLive(t *testing.T) {
+	if !hostWasLive(hostResult{LatencyMS: 3}) {
+		t.Fatal("ping response should count as live")
+	}
+	if hostWasLive(hostResult{}) {
+		t.Fatal("empty host should not count as live")
+	}
+	if !hostWasLive(hostResult{Status: "dead"}) {
+		t.Fatal("dead rows should remain tracked")
 	}
 }
 
 func TestLookupMACInvalid(t *testing.T) {
 	if got := lookupMAC("not-an-ip"); got != "" {
 		t.Fatalf("expected empty for invalid ip, got %q", got)
+	}
+}
+
+func TestSplitIPChunks(t *testing.T) {
+	ips := make([]string, 300)
+	for i := range ips {
+		ips[i] = fmt.Sprintf("10.0.%d.1", i/254)
+	}
+	chunks := splitIPChunks(ips, tuiWatchChunkSize)
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2", len(chunks))
+	}
+	if len(chunks[0]) != 256 || len(chunks[1]) != 44 {
+		t.Fatalf("chunk sizes %d and %d", len(chunks[0]), len(chunks[1]))
+	}
+	single := splitIPChunks(ips[:10], tuiWatchChunkSize)
+	if len(single) != 1 || len(single[0]) != 10 {
+		t.Fatalf("small range chunks=%v", single)
+	}
+}
+
+func TestWatchPingTimeout(t *testing.T) {
+	if got := watchPingTimeout(time.Second); got != 500*time.Millisecond {
+		t.Fatalf("got %s", got)
+	}
+	if got := watchPingTimeout(200 * time.Millisecond); got != 200*time.Millisecond {
+		t.Fatalf("got %s", got)
+	}
+}
+
+func TestShouldIncludeHost(t *testing.T) {
+	arp := map[string]arpCacheEntry{"192.168.1.5": {MAC: "aa:bb:cc:dd:ee:ff"}}
+	if !shouldIncludeHost([]portResult{{Port: 80}}, enrichConfig{}, arp, "192.168.1.1") {
+		t.Fatal("open port should include host")
+	}
+	if shouldIncludeHost(nil, enrichConfig{}, arp, "192.168.1.1") {
+		t.Fatal("empty ports without arp-dead should exclude")
+	}
+	if !shouldIncludeHost(nil, enrichConfig{arpCache: true}, arp, "192.168.1.5") {
+		t.Fatal("arp-dead host should include")
+	}
+}
+
+func TestBuildARPDeadByIP(t *testing.T) {
+	arp := map[string]arpCacheEntry{
+		"192.168.1.1": {MAC: "aa:bb:cc:dd:ee:01"},
+		"192.168.1.2": {MAC: "aa:bb:cc:dd:ee:02"},
+	}
+	dead := buildARPDeadByIP(arp, map[string]struct{}{"192.168.1.1": {}})
+	if len(dead) != 1 || dead["192.168.1.2"].MAC == "" {
+		t.Fatalf("dead=%v", dead)
 	}
 }
 
@@ -700,5 +968,48 @@ func TestLessIP(t *testing.T) {
 	}
 	if lessIP("10.0.0.1", "10.0.0.1") {
 		t.Fatal("equal IPs are not less")
+	}
+}
+
+func TestStripHelpArgs(t *testing.T) {
+	args, help := stripHelpArgs([]string{"-h", "--local"})
+	if !help {
+		t.Fatal("expected help")
+	}
+	if len(args) != 1 || args[0] != "--local" {
+		t.Fatalf("args=%v", args)
+	}
+	args, help = stripHelpArgs([]string{"192.168.1.0/24", "--help"})
+	if !help {
+		t.Fatal("expected help")
+	}
+	if len(args) != 1 || args[0] != "192.168.1.0/24" {
+		t.Fatalf("args=%v", args)
+	}
+}
+
+func TestRunHelp(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"-h"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"Usage:", "ipscry [CIDR]", "-h, --help"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("help missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "ipscry scan") {
+		t.Fatalf("help should not mention scan subcommand:\n%s", text)
+	}
+}
+
+func TestRunVersion(t *testing.T) {
+	var out bytes.Buffer
+	if err := run([]string{"version"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), appVersion) {
+		t.Fatalf("got %q", out.String())
 	}
 }

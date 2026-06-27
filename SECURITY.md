@@ -37,9 +37,8 @@ misuse.
 
 ## Security-relevant design notes
 
-- The only feature that contacts the internet is the opt-in `--mac-vendor`
-  lookup, which is **off by default**. When enabled, only deduplicated,
-  rate-limited MAC OUIs leave the host.
+- Port service labels and MAC vendor names come from embedded static datasets
+  compiled into the binary. No external API calls are made at runtime.
 - TLS probes use `InsecureSkipVerify` deliberately — Ipscry inventories
   certificate subjects and must not trust or depend on remote identity. No data
   is transmitted to those endpoints beyond the standard handshake/GET.

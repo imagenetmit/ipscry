@@ -4,7 +4,6 @@
 *.syso
 
 # Scan artifacts
-/ipscry-output/
 scan.json
 scan.csv
 scan.log
@@ -13,5 +12,10 @@ scan.log
 *.test
 *.out
 
+# Regeneration source (embedded data lives in data/)
+mac-vendors-export.json
+
 # Local Cursor state
 .cursor/hooks/state/
+*.csv
+.cursor/plans/embed_ports_and_mac_data_4da2adf3.plan.md

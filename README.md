@@ -21,7 +21,8 @@ auditable JSON, CSV, and log artifacts.
   and NetBIOS node status, so modern and legacy Windows hosts both resolve.
 - **Lightweight service fingerprinting** — banners, HTTP status/server/title, and
   TLS certificate subjects, plus a heuristic device-type guess.
-- **Optional enrichment** — SNMP v2c system group and opt-in MAC vendor lookup.
+- **Optional enrichment** — SNMP v2c system group, embedded port-service metadata,
+  and offline MAC vendor lookup (local subnet).
 - **Auditable artifacts** — deterministic JSON, CSV, and a UTC audit log.
 - **Single static binary** — no runtime dependencies; trivial to stage and
   allowlist by hash.
@@ -32,7 +33,7 @@ auditable JSON, CSV, and log artifacts.
 - [Run](#run)
 - [Port selection](#port-selection)
 - [Name resolution](#name-resolution)
-- [MAC vendor lookup (opt-in)](#mac-vendor-lookup-opt-in)
+- [MAC vendor lookup](#mac-vendor-lookup)
 - [Internal Signing](#internal-signing)
 - [AV/EDR Posture](#avedr-posture)
 - [Responsible use](#responsible-use)
@@ -49,20 +50,46 @@ go build -trimpath -o ipscry.exe .
 
 ## Run
 
-Recommended conservative NinjaRMM command:
+Interactive scan (results print to the console; no files written unless requested):
 
 ```powershell
-C:\ProgramData\ipscry\ipscry.exe scan --local --timeout 750ms --concurrency 128 --json C:\ProgramData\ipscry\scan.json --csv C:\ProgramData\ipscry\scan.csv --log C:\ProgramData\ipscry\scan.log
+.\ipscry.exe scan
 ```
-
-For RMM deployment, stage `ipscry.exe` at `C:\ProgramData\ipscry\ipscry.exe`
-and run the command above from your tool's script or package runner.
 
 Explicit CIDR:
 
 ```powershell
-C:\ProgramData\ipscry\ipscry.exe scan 192.168.1.0/24
+.\ipscry.exe scan 192.168.1.0/24
 ```
+
+Pass `-j`, `-C`, and/or `-L` with paths when you want artifacts on disk. NinjaRMM
+(or other unattended runners) typically sets all three — for example:
+
+```powershell
+C:\imagenet\ipscry.exe scan --timeout 750ms --json C:\imagenet\scan.json --csv C:\imagenet\scan.csv --log C:\imagenet\scan.log
+```
+
+## Live terminal UI
+
+When run interactively, `ipscry` shows a live terminal UI (TUI) by default: a
+real-time scan progress bar, a results table, ongoing host watch, scrollable host
+list (arrows / PageUp / PageDown / Home / End), and in-UI export (`c` CSV, `j`
+JSON, `t` TXT). Press Enter to exit.
+
+The TUI is **automatically disabled** when an output path (`-j`, `-C`, or `-L`) is
+requested or when there is no interactive terminal (piped/unattended runs), so RMM
+and automation behavior is unchanged. Use `-N`/`--no-tui` to force it off, or
+`-T`/`--tui` to force it on even when writing artifacts. Set `NO_COLOR` to disable
+ANSI colors.
+
+### Watch behaviour and latency stats
+
+During watch the table shows per-host `min`/`max`/`avg` latency (avg is a moving
+average of the last 6 successful pings). Responsive hosts are pinged on a relaxed
+5s sweep. When a host that was responding **misses one ping**, its `ms` cell shows
+a `-` (flagged `!` in the status column) and it is re-probed once per second; the
+cell fades progressively redder with each consecutive miss and the host is marked
+`down` after 10 misses (~10s). A single successful reply resets it to the 5s sweep.
 
 Default ports:
 
@@ -85,8 +112,8 @@ Default ports:
 --ports 8000-8100,9100  # ranges plus single ports
 ```
 
-Add `--progress` to print periodic scan progress to stderr (off by default so
-NinjaRMM logs stay clean).
+Progress prints to stderr during interactive scans (on by default). It stays off
+when `-j`, `-C`, or `-L` is set unless you pass `-P` explicitly.
 
 ## Name resolution
 
@@ -101,23 +128,27 @@ because no single method covers every device:
 3. **NetBIOS node status** (UDP/137) — for older SMB/Windows devices that still
    answer `nbtstat`-style queries.
 
-## MAC vendor lookup (opt-in)
+## MAC vendor lookup
 
-`--mac-vendor` enriches each host with its hardware MAC address and the vendor that
-owns the OUI:
+Each discovered host on the **local subnet** is enriched with its hardware MAC
+address (via Windows `SendARP`) and the vendor that owns the OUI. Lookups use an
+embedded IEEE OUI database — fully offline, no API calls.
+
+- MAC addresses are only available for hosts on the local subnet (the default
+  `--local` case). Routed hosts reached via an explicit CIDR will have no MAC.
+- Vendor names appear in JSON/CSV output and in the console table when known.
+
+## Port metadata
+
+Open ports include embedded service labels and common software/product names
+(`vendors` field in JSON/CSV). Data is compiled into the binary from
+`data/ports.csv`.
+
+To regenerate the MAC vendor blob after updating the IEEE export:
 
 ```powershell
-C:\ProgramData\ipscry\ipscry.exe scan --local --mac-vendor
+go run tools/gendata/main.go mac-vendors-export.json data/mac_vendors.csv.gz
 ```
-
-- MAC addresses come from the OS ARP table (Windows `SendARP`), so they are only
-  available for hosts on the **local subnet** — the default `--local` case. Routed
-  hosts reached via an explicit CIDR will have no MAC.
-- Vendor names come from the free **macvendorlookup.com** API. To stay within its
-  fair-use policy, ipscry queries **once per unique OUI** (caching results) and
-  **serializes requests with a one-second minimum gap**.
-- It is **off by default**. Enable it for interactive/ad-hoc inventory; leave it off
-  for unattended NinjaRMM runs that should stay fully offline.
 
 ## Internal Signing
 
@@ -152,7 +183,7 @@ Sign the executable after building:
 Verify on a managed endpoint:
 
 ```powershell
-Get-AuthenticodeSignature C:\ProgramData\ipscry\ipscry.exe
+Get-AuthenticodeSignature .\ipscry.exe
 ```
 
 Expected status:
@@ -173,10 +204,7 @@ same exchange `nmap -sV` / `smb-os-discovery` performs) to read the advertised
 computer name. No credentials are submitted and no SMB share is accessed; it is a
 read-only protocol negotiation over an ordinary TCP socket.
 
-The optional `--mac-vendor` flag is the one feature that contacts the internet (the
-macvendorlookup.com API). It is **off by default** so the standard configuration
-remains fully self-contained and offline. When enabled, only MAC OUIs leave the
-host, deduplicated and rate-limited.
+Ipscry is fully offline by default. No runtime downloads, no external API calls.
 
 ## Responsible use
 

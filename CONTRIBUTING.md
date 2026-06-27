@@ -64,8 +64,8 @@ not** introduce:
 - credential submission, exploitation, or vulnerability probing;
 - persistence, hidden execution, or script-wrapper launchers.
 
-The optional `--mac-vendor` flag is the only feature that may contact the
-internet, and it must stay **off by default**.
+Ipscry makes no external API calls at runtime. All port and MAC vendor metadata
+is embedded in the binary.
 
 ## Reporting bugs and requesting features
 

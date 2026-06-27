@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -105,11 +104,14 @@ type scanConfig struct {
 	Timeout       time.Duration
 	Concurrency   int
 	Progress      bool
+	TUI           bool
 	SNMPCommunity string
-	MACVendor     bool
 	JSONPath      string
 	CSVPath       string
 	LogPath       string
+	MACFormat     string
+	ARPCache      bool
+	AIP           bool
 }
 
 type scanReport struct {
@@ -125,19 +127,25 @@ type scanReport struct {
 }
 
 type hostResult struct {
-	IP        string       `json:"ip"`
-	Hostname  string       `json:"hostname,omitempty"`
-	MAC       string       `json:"mac,omitempty"`
-	MACVendor string       `json:"mac_vendor,omitempty"`
-	SysName   string       `json:"snmp_sysname,omitempty"`
-	SysDescr  string       `json:"snmp_sysdescr,omitempty"`
-	OpenPorts []portResult `json:"open_ports"`
-	Guess     string       `json:"guess"`
+	IP         string       `json:"ip"`
+	MAC        string       `json:"mac,omitempty"`
+	MACVendor  string       `json:"mac_vendor,omitempty"`
+	LatencyMS  int64        `json:"latency_ms"`
+	ARPType    string       `json:"arp_type,omitempty"`
+	ARPIfIndex uint32       `json:"arp_ifindex,omitempty"`
+	ARPIfAlias string       `json:"arp_ifalias,omitempty"`
+	Hostname   string       `json:"hostname,omitempty"`
+	SysName    string       `json:"snmp_sysname,omitempty"`
+	SysDescr   string       `json:"snmp_sysdescr,omitempty"`
+	OpenPorts  []portResult `json:"open_ports"`
+	Guess      string       `json:"guess"`
+	Status     string       `json:"status,omitempty"`
 }
 
 type portResult struct {
 	Port       int    `json:"port"`
 	Service    string `json:"service"`
+	Vendors    string `json:"vendors,omitempty"`
 	Banner     string `json:"banner,omitempty"`
 	HTTPStatus string `json:"http_status,omitempty"`
 	HTTPServer string `json:"http_server,omitempty"`
@@ -147,8 +155,17 @@ type portResult struct {
 }
 
 type portScanResult struct {
-	ip   string
-	port portResult
+	ip        string
+	port      portResult
+	latencyMS int64
+}
+
+type arpCacheEntry struct {
+	IP      string
+	MAC     string
+	Kind    string // dynamic, static
+	IfIndex uint32
+	IfAlias string
 }
 
 func main() {
@@ -159,23 +176,17 @@ func main() {
 }
 
 func run(args []string, stdout io.Writer, stderr io.Writer) error {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	args, showHelp := stripHelpArgs(args)
+	if showHelp {
 		printUsage(stdout)
 		return nil
 	}
-	if args[0] == "version" || args[0] == "--version" {
+	if len(args) == 1 && (args[0] == "version" || args[0] == "--version") {
 		fmt.Fprintf(stdout, "%s %s\n", appName, appVersion)
 		return nil
 	}
-	if args[0] != "scan" {
-		return fmt.Errorf("unknown command %q", args[0])
-	}
-	if len(args) > 1 && (args[1] == "-h" || args[1] == "--help") {
-		printUsage(stdout)
-		return nil
-	}
 
-	cfg, err := parseScanArgs(args[1:])
+	cfg, err := parseScanArgs(args)
 	if err != nil {
 		return err
 	}
@@ -201,15 +212,47 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	defer stop()
 
 	var progress io.Writer
-	if cfg.Progress {
+	var monitor scanMonitor
+	var tui *scanTUI
+	if cfg.TUI {
+		tui, err = newScanTUI(stdout)
+		if err != nil {
+			// No interactive terminal (piped/unattended); fall back to plain output.
+			tui, cfg.TUI = nil, false
+		} else {
+			defer tui.Close()
+			monitor = tui
+			tui.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)))
+		}
+	}
+	if !cfg.TUI && cfg.Progress {
 		progress = stderr
 	}
-	enrich := enrichConfig{snmpCommunity: cfg.SNMPCommunity}
-	if cfg.MACVendor {
-		enrich.macResolver = newMACVendorResolver()
+	enrich := enrichConfig{
+		snmpCommunity: cfg.SNMPCommunity,
+		arpCache:      cfg.ARPCache,
+		targetCIDR:    cfg.Target,
 	}
-	hosts := scanNetwork(ctx, ips, cfg.Ports, cfg.Timeout, cfg.Concurrency, enrich, logger, progress)
+	hosts := scanNetwork(ctx, ips, cfg.Ports, cfg.Timeout, cfg.Concurrency, enrich, logger, progress, monitor)
 	completed := time.Now().UTC()
+	elapsed := completed.Sub(started)
+	if tui != nil {
+		tui.Finish(hosts, elapsed, ctx, tuiWatchConfig{
+			ips:         ips,
+			ports:       cfg.Ports,
+			timeout:     cfg.Timeout,
+			concurrency: cfg.Concurrency,
+			enrich:      enrich,
+			logger:      logger,
+			macFormat:   cfg.MACFormat,
+			started:     started,
+		})
+	}
+
+	for _, host := range hosts {
+		logger.Printf("host ip=%s mac=%s latency_ms=%d status=%s arp_type=%s arp_ifindex=%d mac_vendor=%s hostname=%s guess=%s",
+			host.IP, formatMAC(host.MAC, cfg.MACFormat), host.LatencyMS, host.Status, host.ARPType, host.ARPIfIndex, host.MACVendor, host.Hostname, host.Guess)
+	}
 
 	report := scanReport{
 		Scanner:     appName,
@@ -227,30 +270,53 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	logger.Printf("completed_at=%s discovered_hosts=%d duration=%s", completed.Format(time.RFC3339), len(hosts), completed.Sub(started))
-	printTable(stdout, report)
+	logger.Printf("completed_at=%s discovered_hosts=%d duration=%s", completed.Format(time.RFC3339), len(hosts), elapsed)
+	if tui != nil {
+		tui.WaitExit(ctx)
+	} else if cfg.AIP {
+		printAIPTable(stdout, report, cfg.MACFormat)
+	} else {
+		printTable(stdout, report, cfg.MACFormat)
+	}
 	return nil
+}
+
+func stripHelpArgs(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	help := false
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			help = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, help
 }
 
 func parseScanArgs(args []string) (scanConfig, error) {
 	cfg := scanConfig{
 		Ports:       append([]int(nil), defaultPorts...),
 		Timeout:     750 * time.Millisecond,
-		Concurrency: 128,
+		Concurrency: 1024,
 	}
 
-	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	local := fs.Bool("local", false, "scan active local /24")
 	ports := fs.String("ports", "common", "profile (common|web|windows|db), list, or ranges")
 	timeout := fs.Duration("timeout", cfg.Timeout, "TCP connect timeout")
 	concurrency := fs.Int("concurrency", cfg.Concurrency, "maximum concurrent port checks")
 	progress := fs.Bool("progress", false, "print scan progress to stderr")
+	tui := fs.Bool("tui", false, "force the live terminal UI")
+	noTUI := fs.Bool("no-tui", false, "disable the live terminal UI")
 	snmpCommunity := fs.String("snmp-community", "public", "SNMP v2c community for enrichment (empty to disable)")
-	macVendor := fs.Bool("mac-vendor", false, "look up MAC vendor via macvendorlookup.com (local subnet only)")
 	jsonPath := fs.String("json", "", "write JSON results to path")
 	csvPath := fs.String("csv", "", "write CSV results to path")
 	logPath := fs.String("log", "", "write audit log to path")
+	macFormat := fs.String("mac-format", "colon", "MAC format: colon, none, dash")
+	arpCache := fs.Bool("arp-dead", false, "include IPs from the local ARP cache with no open ports")
+	aipView := fs.Bool("aip", false, "display results like Advanced IP Scanner")
 
 	normalizedArgs, positional, err := normalizeScanArgs(args)
 	if err != nil {
@@ -269,20 +335,40 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	cfg.Concurrency = *concurrency
 	cfg.Local = *local
 	cfg.SNMPCommunity = *snmpCommunity
-	cfg.MACVendor = *macVendor
-	cfg.JSONPath = defaultPathIfEmpty(*jsonPath, "scan.json")
-	cfg.CSVPath = defaultPathIfEmpty(*csvPath, "scan.csv")
-	cfg.LogPath = defaultPathIfEmpty(*logPath, "scan.log")
+	cfg.JSONPath = strings.TrimSpace(*jsonPath)
+	cfg.CSVPath = strings.TrimSpace(*csvPath)
+	cfg.LogPath = strings.TrimSpace(*logPath)
+	cfg.MACFormat = strings.ToLower(strings.TrimSpace(*macFormat))
+	cfg.ARPCache = *arpCache
+	cfg.AIP = *aipView
+	if cfg.AIP {
+		cfg.ARPCache = true
+	}
 
-	// Progress defaults on for interactive use, but stays off when an output path
-	// was explicitly requested (typically unattended/NinjaRMM runs). An explicit
-	// --progress always wins.
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	hasOutputPath := set["json"] || set["csv"] || set["log"]
+
+	// The live TUI is the default for interactive use. It is turned off by
+	// --no-tui, and auto-disabled when an output path is requested (typically
+	// unattended/NinjaRMM runs); --tui forces it back on. runScan additionally
+	// falls back to plain output when there is no interactive terminal.
+	switch {
+	case *noTUI:
+		cfg.TUI = false
+	case *tui:
+		cfg.TUI = true
+	default:
+		cfg.TUI = !hasOutputPath
+	}
+
+	// Progress (stderr) defaults on unless an output path was requested; an
+	// explicit --progress always wins. It is only emitted when the TUI is not
+	// active (see runScan), so the two never overlap.
 	if set["progress"] {
 		cfg.Progress = *progress
 	} else {
-		cfg.Progress = !(set["json"] || set["csv"] || set["log"])
+		cfg.Progress = !hasOutputPath
 	}
 
 	if cfg.Timeout <= 0 {
@@ -291,10 +377,15 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	if cfg.Concurrency < 1 || cfg.Concurrency > 2048 {
 		return cfg, errors.New("concurrency must be between 1 and 2048")
 	}
+	switch cfg.MACFormat {
+	case "colon", "none", "dash":
+	default:
+		return cfg, errors.New("mac-format must be colon, none, or dash")
+	}
 
 	switch {
 	case len(positional) > 1:
-		return cfg, errors.New("scan accepts at most one target CIDR")
+		return cfg, errors.New("accept at most one target CIDR")
 	case len(positional) == 1:
 		if cfg.Local {
 			return cfg, errors.New("provide either --local or an explicit CIDR, not both")
@@ -315,31 +406,73 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	return cfg, nil
 }
 
-func normalizeScanArgs(args []string) ([]string, []string, error) {
-	valueFlags := map[string]bool{
-		"--ports": true, "--timeout": true, "--concurrency": true,
-		"--snmp-community": true, "--json": true, "--csv": true, "--log": true,
+// scanFlagAliases maps single-letter flags to their long names.
+var scanFlagAliases = map[string]string{
+	"l": "local",
+	"p": "ports",
+	"t": "timeout",
+	"c": "concurrency",
+	"P": "progress",
+	"T": "tui",
+	"N": "no-tui",
+	"j": "json",
+	"C": "csv",
+	"L": "log",
+	"m": "mac-format",
+	"a": "arp-dead",
+	"s": "snmp-community",
+}
+
+var scanValueFlags = map[string]bool{
+	"ports": true, "timeout": true, "concurrency": true,
+	"snmp-community": true, "json": true, "csv": true, "log": true, "mac-format": true,
+}
+
+func normalizeFlagToken(arg string) (string, error) {
+	if !strings.HasPrefix(arg, "-") {
+		return "", fmt.Errorf("not a flag: %s", arg)
 	}
+	body := strings.TrimLeft(arg, "-")
+	suffix := ""
+	if idx := strings.Index(body, "="); idx >= 0 {
+		suffix = body[idx:]
+		body = body[:idx]
+	}
+	if long, ok := scanFlagAliases[body]; ok {
+		return "--" + long + suffix, nil
+	}
+	if scanValueFlags[body] || body == "local" || body == "progress" || body == "tui" || body == "no-tui" || body == "arp-dead" || body == "aip" {
+		return "--" + body + suffix, nil
+	}
+	return "", fmt.Errorf("unknown flag %s", arg)
+}
+
+func normalizeScanArgs(args []string) ([]string, []string, error) {
 	var flags []string
 	var positional []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if strings.HasPrefix(arg, "--") {
-			flags = append(flags, arg)
-			name := arg
-			if idx := strings.Index(arg, "="); idx >= 0 {
-				name = arg[:idx]
-			}
-			if valueFlags[name] && !strings.Contains(arg, "=") {
-				if i+1 >= len(args) {
-					return nil, nil, fmt.Errorf("missing value for %s", arg)
-				}
-				i++
-				flags = append(flags, args[i])
-			}
+		if !strings.HasPrefix(arg, "-") {
+			positional = append(positional, arg)
 			continue
 		}
-		positional = append(positional, arg)
+		normalized, err := normalizeFlagToken(arg)
+		if err != nil {
+			return nil, nil, err
+		}
+		flags = append(flags, normalized)
+		name := normalized
+		if idx := strings.Index(normalized, "="); idx >= 0 {
+			name = normalized[:idx]
+		}
+		longName := strings.TrimPrefix(name, "--")
+		if scanValueFlags[longName] && !strings.Contains(normalized, "=") {
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("missing value for %s", arg)
+			}
+			i++
+			flags = append(flags, args[i])
+		}
 	}
 	return flags, positional, nil
 }
@@ -348,20 +481,28 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, `%s %s
 
 Usage:
-  ipscry scan --local [options]
-  ipscry scan 192.168.1.0/24 [options]
+  ipscry [CIDR] [options]
+  ipscry --local [options]
   ipscry version
 
+With no CIDR, scans the active local /24.
+
 Options:
-  --ports common|web|windows|db | 22,80,443 | 8000-8100
-  --timeout 750ms
-  --concurrency 128
-  --progress
-  --snmp-community public
-  --mac-vendor
-  --json PATH
-  --csv PATH
-  --log PATH
+  -h, --help
+  -l, --local
+  -p, --ports common|web|windows|db | 22,80,443 | 8000-8100
+  -t, --timeout 750ms
+  -c, --concurrency 1024
+  -P, --progress
+  -T, --tui             force the live terminal UI (on by default when interactive)
+  -N, --no-tui          disable the live terminal UI
+  -s, --snmp-community public
+  -j, --json PATH       write JSON results (optional)
+  -C, --csv PATH        write CSV results (optional)
+  -L, --log PATH        write audit log (optional)
+  -m, --mac-format colon|none|dash
+  -a, --arp-dead        include offline hosts from the local ARP cache
+      --aip             Advanced IP Scanner-style results table
 `, appName, appVersion)
 }
 
@@ -421,24 +562,10 @@ func parsePorts(input string) ([]int, error) {
 	return ports, nil
 }
 
-func defaultPathIfEmpty(path string, name string) string {
-	if strings.TrimSpace(path) != "" {
-		return path
-	}
-	return filepath.Join(defaultArtifactDir(), name)
-}
-
-func defaultArtifactDir() string {
-	if runtime.GOOS == "windows" {
-		if programData := os.Getenv("ProgramData"); programData != "" {
-			return filepath.Join(programData, "ipscry")
-		}
-		return `C:\ProgramData\ipscry`
-	}
-	return "ipscry-output"
-}
-
 func configureLog(path string) (*log.Logger, func(), error) {
+	if path == "" {
+		return log.New(io.Discard, "", 0), func() {}, nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, func() {}, err
 	}
@@ -523,6 +650,59 @@ func expandCIDR(cidr string) ([]string, error) {
 	return ips, nil
 }
 
+func arpCacheForTarget(ipNet *net.IPNet) map[string]arpCacheEntry {
+	out := map[string]arpCacheEntry{}
+	for _, entry := range arpCacheEntries() {
+		if !ipInTarget(entry.IP, ipNet) || !validARPMAC(entry.MAC) {
+			continue
+		}
+		out[entry.IP] = entry
+	}
+	return out
+}
+
+func mergeARPCacheHosts(live map[string]struct{}, entries []arpCacheEntry, ipNet *net.IPNet) []arpCacheEntry {
+	var out []arpCacheEntry
+	for _, entry := range entries {
+		if _, ok := live[entry.IP]; ok {
+			continue
+		}
+		if !ipInTarget(entry.IP, ipNet) || !validARPMAC(entry.MAC) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool { return lessIP(out[i].IP, out[j].IP) })
+	return out
+}
+
+func ipInTarget(ip string, ipNet *net.IPNet) bool {
+	parsed := net.ParseIP(ip).To4()
+	if parsed == nil || !ipNet.Contains(parsed) {
+		return false
+	}
+	if parsed.Equal(ipNet.IP.To4()) {
+		return false
+	}
+	broadcast := make(net.IP, len(parsed))
+	for i := range parsed {
+		broadcast[i] = ipNet.IP[i] | ^ipNet.Mask[i]
+	}
+	return !parsed.Equal(broadcast.To4())
+}
+
+func validARPMAC(mac string) bool {
+	hex := macHexDigits(mac)
+	if len(hex) != 12 || hex == "000000000000" || hex == "FFFFFFFFFFFF" {
+		return false
+	}
+	first, err := strconv.ParseUint(hex[0:2], 16, 8)
+	if err != nil || first&1 == 1 {
+		return false
+	}
+	return true
+}
+
 func incIP(ip net.IP) {
 	for i := len(ip) - 1; i >= 0; i-- {
 		ip[i]++
@@ -536,10 +716,11 @@ func incIP(ip net.IP) {
 // host's open ports are known.
 type enrichConfig struct {
 	snmpCommunity string
-	macResolver   *macVendorResolver // nil when MAC/vendor lookup is disabled
+	arpCache      bool
+	targetCIDR    string
 }
 
-func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Duration, concurrency int, enrich enrichConfig, logger *log.Logger, progress io.Writer) []hostResult {
+func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Duration, concurrency int, enrich enrichConfig, logger *log.Logger, progress io.Writer, monitor scanMonitor) []hostResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -578,9 +759,9 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 		close(results)
 	}()
 
-	// Optional periodic progress to stderr while results stream in.
+	// Optional periodic progress while results stream in.
 	stopProgress := make(chan struct{})
-	if progress != nil && total > 0 {
+	if total > 0 && (progress != nil || monitor != nil) {
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
@@ -589,7 +770,13 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 				case <-stopProgress:
 					return
 				case <-ticker.C:
-					fmt.Fprintf(progress, "\rscanning %d/%d ports...", atomic.LoadInt64(&scanned), total)
+					n := atomic.LoadInt64(&scanned)
+					if monitor != nil {
+						monitor.PortProgress(n, total)
+					}
+					if progress != nil {
+						fmt.Fprintf(progress, "\rscanning %d/%d ports...", n, total)
+					}
 				}
 			}
 		}()
@@ -598,16 +785,47 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	byIP := map[string][]portResult{}
 	for result := range results {
 		byIP[result.ip] = append(byIP[result.ip], result.port)
+		if monitor != nil {
+			monitor.PortOpen(result.ip, result.latencyMS)
+		}
 		logger.Printf("open ip=%s port=%d service=%s", result.ip, result.port.Port, result.port.Service)
 	}
 	close(stopProgress)
 	if progress != nil && total > 0 {
 		fmt.Fprintf(progress, "\rscanned %d/%d ports        \n", atomic.LoadInt64(&scanned), total)
 	}
+	if monitor != nil && total > 0 {
+		monitor.PortProgress(total, total)
+	}
+
+	_, ipNet, err := net.ParseCIDR(enrich.targetCIDR)
+	if err != nil {
+		return nil
+	}
+	arpByIP := arpCacheForTarget(ipNet)
+	arpDeadByIP := map[string]arpCacheEntry{}
+	if enrich.arpCache {
+		liveIPs := make(map[string]struct{}, len(byIP))
+		for ip := range byIP {
+			liveIPs[ip] = struct{}{}
+		}
+		for ip, entry := range arpByIP {
+			if _, live := liveIPs[ip]; live {
+				continue
+			}
+			arpDeadByIP[ip] = entry
+			if _, ok := byIP[ip]; !ok {
+				byIP[ip] = nil
+			}
+		}
+	}
 
 	var hosts []hostResult
 	var hostMu sync.Mutex
 	var hostWorkers sync.WaitGroup
+	if monitor != nil {
+		monitor.EnrichStart(len(byIP))
+	}
 	for ip, openPorts := range byIP {
 		ip := ip
 		openPorts := openPorts
@@ -615,33 +833,13 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 		hostWorkers.Add(1)
 		go func() {
 			defer hostWorkers.Done()
-			hostname := resolveHostname(ctx, ip, openPorts, timeout)
-			var sysName, sysDescr string
-			if enrich.snmpCommunity != "" {
-				sysName, sysDescr = snmpGet(ctx, ip, enrich.snmpCommunity, minDuration(timeout, time.Second))
-			}
-			if hostname == "" {
-				hostname = sysName
-			}
-			var mac, vendor string
-			if enrich.macResolver != nil {
-				if mac = lookupMAC(ip); mac != "" {
-					vendor = enrich.macResolver.lookup(ctx, mac)
-				}
-			}
-			host := hostResult{
-				IP:        ip,
-				Hostname:  hostname,
-				MAC:       mac,
-				MACVendor: vendor,
-				SysName:   sysName,
-				SysDescr:  sysDescr,
-				OpenPorts: openPorts,
-				Guess:     guessDevice(openPorts, sysDescr),
-			}
+			host := enrichHost(ctx, ip, openPorts, enrich, timeout, arpByIP, arpDeadByIP, -1)
 			hostMu.Lock()
 			hosts = append(hosts, host)
 			hostMu.Unlock()
+			if monitor != nil {
+				monitor.HostReady(host)
+			}
 		}()
 	}
 	hostWorkers.Wait()
@@ -651,18 +849,183 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	return hosts
 }
 
+func scanIPPorts(ctx context.Context, ip string, ports []int, timeout time.Duration, concurrency int) []portResult {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var mu sync.Mutex
+	var open []portResult
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, port := range ports {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(port int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if result, ok := scanPort(ctx, ip, port, timeout); ok {
+				mu.Lock()
+				open = append(open, result.port)
+				mu.Unlock()
+			}
+		}(port)
+	}
+	wg.Wait()
+	sort.Slice(open, func(i, j int) bool { return open[i].Port < open[j].Port })
+	return open
+}
+
+func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich enrichConfig, timeout time.Duration, arpByIP map[string]arpCacheEntry, arpDeadByIP map[string]arpCacheEntry, latencyMS int64) hostResult {
+	hostname := resolveHostname(ctx, ip, openPorts, timeout)
+	var sysName, sysDescr string
+	if enrich.snmpCommunity != "" {
+		sysName, sysDescr = snmpGet(ctx, ip, enrich.snmpCommunity, minDuration(timeout, time.Second))
+	}
+	if hostname == "" {
+		hostname = sysName
+	}
+	arpEntry, inARP := arpByIP[ip]
+	mac := ""
+	arpType := ""
+	var arpIfIndex uint32
+	arpIfAlias := ""
+	if inARP {
+		mac = arpEntry.MAC
+		arpType = arpEntry.Kind
+		arpIfIndex = arpEntry.IfIndex
+		arpIfAlias = arpEntry.IfAlias
+	}
+	if mac == "" {
+		mac = lookupMAC(ip)
+	}
+	vendor := ""
+	if mac != "" {
+		vendor = macVendor(mac)
+	}
+	latency := latencyMS
+	if latency < 0 {
+		if ms, ok := pingHost(ctx, ip, minDuration(timeout, 2*time.Second)); ok {
+			latency = ms
+		}
+	}
+	status := ""
+	guess := guessDevice(openPorts, sysDescr)
+	if enrich.arpCache {
+		if len(openPorts) > 0 {
+			status = "live"
+		} else if _, ok := arpDeadByIP[ip]; ok {
+			status = "arp"
+			guess = "offline"
+		}
+	}
+	return hostResult{
+		IP:         ip,
+		MAC:        mac,
+		MACVendor:  vendor,
+		LatencyMS:  latency,
+		ARPType:    arpType,
+		ARPIfIndex: arpIfIndex,
+		ARPIfAlias: arpIfAlias,
+		Hostname:   hostname,
+		SysName:    sysName,
+		SysDescr:   sysDescr,
+		OpenPorts:  openPorts,
+		Guess:      guess,
+		Status:     status,
+	}
+}
+
+func shouldIncludeHost(openPorts []portResult, enrich enrichConfig, arpByIP map[string]arpCacheEntry, ip string) bool {
+	if len(openPorts) > 0 {
+		return true
+	}
+	if enrich.arpCache {
+		if _, ok := arpByIP[ip]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func buildARPDeadByIP(arpByIP map[string]arpCacheEntry, liveIPs map[string]struct{}) map[string]arpCacheEntry {
+	arpDeadByIP := map[string]arpCacheEntry{}
+	for ip, entry := range arpByIP {
+		if _, live := liveIPs[ip]; live {
+			continue
+		}
+		arpDeadByIP[ip] = entry
+	}
+	return arpDeadByIP
+}
+
+func pingSweep(ctx context.Context, ips []string, timeout time.Duration, concurrency int) map[string]int64 {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	pingTimeout := minDuration(timeout, 2*time.Second)
+	results := make(map[string]int64, len(ips))
+	var mu sync.Mutex
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ms, ok := pingHost(ctx, ip, pingTimeout)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			results[ip] = ms
+			mu.Unlock()
+		}(ip)
+	}
+	wg.Wait()
+	return results
+}
+
+const tuiWatchChunkSize = 256
+
+func splitIPChunks(ips []string, size int) [][]string {
+	if size <= 0 || len(ips) <= size {
+		return [][]string{ips}
+	}
+	chunks := make([][]string, 0, (len(ips)+size-1)/size)
+	for i := 0; i < len(ips); i += size {
+		end := i + size
+		if end > len(ips) {
+			end = len(ips)
+		}
+		chunks = append(chunks, ips[i:end])
+	}
+	return chunks
+}
+
+func watchPingTimeout(timeout time.Duration) time.Duration {
+	return minDuration(timeout, 500*time.Millisecond)
+}
+
 func scanPort(ctx context.Context, ip string, port int, timeout time.Duration) (portScanResult, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	info := portCatalog[port]
-	pr := portResult{Port: port, Service: serviceName(port)}
+	pr := portResult{Port: port, Service: serviceLabel(port), Vendors: portVendors(port)}
 
 	// HTTP ports: the HTTP client performs its own dial. A response (any status)
 	// proves the port is open and yields the richest metadata in one round-trip.
 	if info.http {
+		start := time.Now()
 		if probeHTTP(ctx, ip, port, timeout, &pr) {
-			return portScanResult{ip: ip, port: pr}, true
+			return portScanResult{ip: ip, port: pr, latencyMS: time.Since(start).Milliseconds()}, true
 		}
 		// Probe failed; pr.ProbeError is retained and we fall through to a plain
 		// TCP check so an open-but-not-HTTP port is still reported.
@@ -671,18 +1034,21 @@ func scanPort(ctx context.Context, ip string, port int, timeout time.Duration) (
 	// TLS-only ports: dial with TLS directly so the single connection both proves
 	// the port is open and surfaces the certificate subject.
 	if info.tls && !info.http {
+		start := time.Now()
 		if probeTLS(ctx, ip, port, timeout, &pr) {
-			return portScanResult{ip: ip, port: pr}, true
+			return portScanResult{ip: ip, port: pr, latencyMS: time.Since(start).Milliseconds()}, true
 		}
 	}
 
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	dialer := net.Dialer{Timeout: timeout}
+	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return portScanResult{}, false
 	}
 	defer conn.Close()
+	latencyMS := time.Since(start).Milliseconds()
 
 	if info.banner {
 		_ = conn.SetReadDeadline(time.Now().Add(minDuration(timeout, 300*time.Millisecond)))
@@ -692,14 +1058,7 @@ func scanPort(ctx context.Context, ip string, port int, timeout time.Duration) (
 		}
 	}
 
-	return portScanResult{ip: ip, port: pr}, true
-}
-
-func serviceName(port int) string {
-	if info, ok := portCatalog[port]; ok {
-		return info.service
-	}
-	return "unknown"
+	return portScanResult{ip: ip, port: pr, latencyMS: latencyMS}, true
 }
 
 func probeHTTP(ctx context.Context, ip string, port int, timeout time.Duration, pr *portResult) bool {
@@ -1090,105 +1449,6 @@ func utf16LE(b []byte) string {
 	return string(utf16.Decode(codes))
 }
 
-// macVendorResolver looks up the vendor for a MAC's OUI via macvendorlookup.com.
-// It dedupes by OUI (caching results) and serializes requests with a minimum gap
-// so the free API is queried responsibly — one request per unique vendor prefix.
-type macVendorResolver struct {
-	client  *http.Client
-	baseURL string
-	minGap  time.Duration
-
-	mu      sync.Mutex
-	cache   map[string]string // OUI (6 hex) -> vendor
-	lastReq time.Time
-}
-
-func newMACVendorResolver() *macVendorResolver {
-	return &macVendorResolver{
-		client:  &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}},
-		baseURL: "https://www.macvendorlookup.com/api/v2/",
-		minGap:  time.Second,
-		cache:   map[string]string{},
-	}
-}
-
-// lookup returns the vendor for the given MAC, or "" if unknown. The lock is held
-// across the request so lookups are both deduped and rate-limited.
-func (r *macVendorResolver) lookup(ctx context.Context, mac string) string {
-	oui := macOUI(mac)
-	if oui == "" {
-		return ""
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if vendor, ok := r.cache[oui]; ok {
-		return vendor
-	}
-	if wait := r.minGap - time.Since(r.lastReq); wait > 0 {
-		select {
-		case <-time.After(wait):
-		case <-ctx.Done():
-			return ""
-		}
-	}
-	r.lastReq = time.Now()
-	vendor := r.fetch(ctx, oui)
-	r.cache[oui] = vendor // cache negatives too, so we don't re-query a dead OUI
-	return vendor
-}
-
-func (r *macVendorResolver) fetch(ctx context.Context, oui string) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.baseURL+oui, nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("User-Agent", appName+"/"+appVersion)
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK { // 204 No Content = no match
-		return ""
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	return parseMACVendor(body)
-}
-
-// parseMACVendor extracts the company name from the API's JSON array response.
-func parseMACVendor(body []byte) string {
-	var entries []struct {
-		Company string `json:"company"`
-	}
-	if err := json.Unmarshal(body, &entries); err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if e.Company != "" {
-			return sanitizeOneLine(e.Company)
-		}
-	}
-	return ""
-}
-
-// macOUI returns the 24-bit OUI (first six hex digits, uppercased) of a MAC, or
-// "" if the input has fewer than six hex digits.
-func macOUI(mac string) string {
-	var sb strings.Builder
-	for _, r := range mac {
-		switch {
-		case r >= '0' && r <= '9', r >= 'A' && r <= 'F':
-			sb.WriteRune(r)
-		case r >= 'a' && r <= 'f':
-			sb.WriteRune(r - 32) // uppercase
-		}
-		if sb.Len() == 6 {
-			return sb.String()
-		}
-	}
-	return ""
-}
-
 // SNMP system-group object identifiers (BER-encoded), used for enrichment.
 var (
 	oidSysDescr = []byte{0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00} // 1.3.6.1.2.1.1.1.0
@@ -1393,31 +1653,35 @@ func guessDevice(ports []portResult, extraText string) string {
 	case has(5060) || has(5061) || containsText("asterisk", "voip", "grandstream", "polycom"):
 		return "voip"
 	case has(902) || containsText("vmware", "esxi", "proxmox", "hyper-v", "hypervisor"):
-		return "hypervisor"
+		return "vm"
 	case containsText("cisco", "mikrotik", "routeros", "edgeos", "juniper", "aruba", "fortigate", "pfsense"):
 		return "network"
 	case has(135) || has(139) || has(445) || has(3389) || has(5985) || has(5986) || containsText("microsoft-iis", "windows server"):
 		return "windows"
 	case has(1433) || has(3306) || has(5432) || containsText("mariadb", "postgresql"):
-		return "database"
+		return "db"
 	case has(22) || has(80) || has(443) || has(8080) || has(8443):
-		return "linux_or_network_appliance"
+		return "linux/device"
 	default:
 		return "unknown"
 	}
 }
 
 func writeArtifacts(report scanReport, cfg scanConfig) error {
-	if err := writeJSON(cfg.JSONPath, report); err != nil {
-		return err
+	if cfg.JSONPath != "" {
+		if err := writeJSON(cfg.JSONPath, report, cfg.MACFormat); err != nil {
+			return err
+		}
 	}
-	if err := writeCSV(cfg.CSVPath, report); err != nil {
-		return err
+	if cfg.CSVPath != "" {
+		if err := writeCSV(cfg.CSVPath, report, cfg.MACFormat); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func writeJSON(path string, report scanReport) error {
+func writeJSON(path string, report scanReport, macFormat string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
@@ -1426,12 +1690,17 @@ func writeJSON(path string, report scanReport) error {
 		return err
 	}
 	defer file.Close()
+	out := report
+	out.Hosts = append([]hostResult(nil), report.Hosts...)
+	for i := range out.Hosts {
+		out.Hosts[i].MAC = formatMAC(out.Hosts[i].MAC, macFormat)
+	}
 	enc := json.NewEncoder(file)
 	enc.SetIndent("", "  ")
-	return enc.Encode(report)
+	return enc.Encode(out)
 }
 
-func writeCSV(path string, report scanReport) error {
+func writeCSV(path string, report scanReport, macFormat string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
@@ -1443,16 +1712,18 @@ func writeCSV(path string, report scanReport) error {
 	w := csv.NewWriter(file)
 	defer w.Flush()
 
-	if err := w.Write([]string{"ip", "hostname", "guess", "port", "service", "banner", "http_status", "http_server", "http_title", "tls_subject", "snmp_sysname", "snmp_sysdescr", "mac", "mac_vendor"}); err != nil {
+	if err := w.Write([]string{"ip", "mac", "mac_vendor", "latency_ms", "hostname", "guess", "status", "arp_type", "arp_ifindex", "port", "service", "vendors", "banner", "http_status", "http_server", "http_title", "tls_subject", "snmp_sysname", "snmp_sysdescr"}); err != nil {
 		return err
 	}
 	for _, host := range report.Hosts {
+		if len(host.OpenPorts) == 0 {
+			if err := w.Write(hostCSVRow(host, portResult{}, macFormat)); err != nil {
+				return err
+			}
+			continue
+		}
 		for _, port := range host.OpenPorts {
-			if err := w.Write([]string{
-				host.IP, host.Hostname, host.Guess, strconv.Itoa(port.Port), port.Service,
-				port.Banner, port.HTTPStatus, port.HTTPServer, port.HTTPTitle, port.TLSSubject,
-				host.SysName, host.SysDescr, host.MAC, host.MACVendor,
-			}); err != nil {
+			if err := w.Write(hostCSVRow(host, port, macFormat)); err != nil {
 				return err
 			}
 		}
@@ -1460,39 +1731,296 @@ func writeCSV(path string, report scanReport) error {
 	return w.Error()
 }
 
-func printTable(w io.Writer, report scanReport) {
+func hostCSVRow(host hostResult, port portResult, macFormat string) []string {
+	portNum := ""
+	service := ""
+	if port.Port > 0 {
+		portNum = strconv.Itoa(port.Port)
+		service = port.Service
+	}
+	return []string{
+		host.IP, formatMAC(host.MAC, macFormat), host.MACVendor, formatLatency(host.LatencyMS),
+		host.Hostname, host.Guess, host.Status, host.ARPType, strconv.FormatUint(uint64(host.ARPIfIndex), 10),
+		portNum, service, port.Vendors,
+		port.Banner, port.HTTPStatus, port.HTTPServer, port.HTTPTitle, port.TLSSubject,
+		host.SysName, host.SysDescr,
+	}
+}
+
+func formatLatency(ms int64) string {
+	if ms < 0 {
+		return ""
+	}
+	return strconv.FormatInt(ms, 10)
+}
+
+func formatLatencyDisplay(ms int64) string {
+	if ms < 0 {
+		return "-"
+	}
+	return strconv.FormatInt(ms, 10)
+}
+
+func formatStatusDisplay(status string) string {
+	switch status {
+	case "live":
+		return "up"
+	default:
+		return status
+	}
+}
+
+func formatPortsDisplay(ports []portResult) string {
+	if len(ports) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(p.Port)
+	}
+	return strings.Join(parts, ",")
+}
+
+func formatGuessDisplay(guess string) string {
+	switch guess {
+	case "linux/device":
+		return "linux/dev"
+	default:
+		return guess
+	}
+}
+
+func formatVendorDisplay(vendor string) string {
+	if vendor == "" {
+		return "-"
+	}
+	v := vendor
+	for _, repl := range []struct{ old, new string }{
+		{", Inc.", ""}, {", Inc", ""}, {" Inc.", ""},
+		{" Corporation", " Corp"}, {" Systems", " Sys"},
+	} {
+		v = strings.ReplaceAll(v, repl.old, repl.new)
+	}
+	return truncDisplay(v, 24)
+}
+
+func formatNameDisplay(name string) string {
+	return truncDisplay(orDash(name), 28)
+}
+
+func truncDisplay(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func formatARPInfo(host hostResult) string {
+	return formatARPNeighborDisplay(host)
+}
+
+func formatARPState(host hostResult) string {
+	if host.ARPType == "" && host.ARPIfIndex == 0 {
+		return "-"
+	}
+	return arpNeighborState(host)
+}
+
+func formatARPAliasCell(host hostResult) string {
+	alias := strings.TrimSpace(host.ARPIfAlias)
+	if alias == "" {
+		return "-"
+	}
+	return truncDisplay(alias, 24)
+}
+
+func formatARPAlias(host hostResult) string {
+	alias := strings.TrimSpace(host.ARPIfAlias)
+	if alias == "" {
+		return "-"
+	}
+	return alias
+}
+
+func formatARPIndex(host hostResult) string {
+	if host.ARPIfIndex == 0 {
+		return "-"
+	}
+	return strconv.FormatUint(uint64(host.ARPIfIndex), 10)
+}
+
+func formatARPNeighborDisplay(host hostResult) string {
+	if host.ARPType == "" && host.ARPIfIndex == 0 {
+		return "-"
+	}
+	state := arpNeighborState(host)
+	alias := strings.TrimSpace(host.ARPIfAlias)
+	if host.ARPIfIndex > 0 {
+		if alias != "" {
+			return fmt.Sprintf("%s %s %d", state, alias, host.ARPIfIndex)
+		}
+		return fmt.Sprintf("%s %d", state, host.ARPIfIndex)
+	}
+	if alias != "" {
+		return fmt.Sprintf("%s %s", state, alias)
+	}
+	return state
+}
+
+func arpNeighborState(host hostResult) string {
+	if host.Status == "dead" {
+		return "Unreachable"
+	}
+	switch host.ARPType {
+	case "dynamic":
+		if host.LatencyMS >= 0 || len(host.OpenPorts) > 0 {
+			return "Reachable"
+		}
+		return "Stale"
+	case "static":
+		return "Permanent"
+	case "invalid":
+		return "Incomplete"
+	default:
+		if host.ARPType != "" {
+			return host.ARPType
+		}
+		return "-"
+	}
+}
+
+func hostWasLive(h hostResult) bool {
+	switch h.Status {
+	case "dead", "live", "arp":
+		return true
+	}
+	if len(h.OpenPorts) > 0 || h.LatencyMS > 0 {
+		return true
+	}
+	return false
+}
+
+func applyARPFromCache(host *hostResult, entry arpCacheEntry) {
+	host.ARPType = entry.Kind
+	host.ARPIfIndex = entry.IfIndex
+	host.ARPIfAlias = entry.IfAlias
+	if entry.MAC != "" {
+		host.MAC = entry.MAC
+	}
+}
+
+func aipStatus(host hostResult) string {
+	if len(host.OpenPorts) > 0 || host.LatencyMS >= 0 {
+		return "up"
+	}
+	return "-"
+}
+
+func aipPing(host hostResult) string {
+	return formatLatency(host.LatencyMS)
+}
+
+// printAIPTable renders results like Advanced IP Scanner: Status, Name, IP,
+// Manufacturer, MAC Address, and Ping (ms).
+func printAIPTable(w io.Writer, report scanReport, macFormat string) {
 	fmt.Fprintf(w, "Target: %s  Hosts: %d  Duration: %s\n", report.Target, len(report.Hosts), report.CompletedAt.Sub(report.StartedAt).Round(time.Millisecond))
 	if len(report.Hosts) == 0 {
 		return
 	}
-	// Only show the Vendor column when MAC lookup actually populated it.
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "Stat\tName\tIP\tMfg\tMAC\tMs")
+	for _, host := range report.Hosts {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			aipStatus(host),
+			formatNameDisplay(host.Hostname),
+			host.IP,
+			formatVendorDisplay(host.MACVendor),
+			orDash(formatMAC(host.MAC, macFormat)),
+			aipPing(host),
+		)
+	}
+	_ = tw.Flush()
+}
+
+func printTable(w io.Writer, report scanReport, macFormat string) {
+	fmt.Fprintf(w, "Target: %s  Hosts: %d  Duration: %s\n", report.Target, len(report.Hosts), report.CompletedAt.Sub(report.StartedAt).Round(time.Millisecond))
+	if len(report.Hosts) == 0 {
+		return
+	}
 	showVendor := false
+	showStatus := false
+	showARP := false
 	for _, host := range report.Hosts {
 		if host.MACVendor != "" {
 			showVendor = true
-			break
+		}
+		if host.Status == "arp" {
+			showStatus = true
+		}
+		if host.ARPType != "" {
+			showARP = true
 		}
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if showVendor {
-		fmt.Fprintln(tw, "IP\tHostname\tVendor\tGuess\tOpen Ports")
-	} else {
-		fmt.Fprintln(tw, "IP\tHostname\tGuess\tOpen Ports")
+	header := []string{"IP", "MAC", "ms", "Name"}
+	if showStatus {
+		header = append(header, "Stat")
 	}
+	if showARP {
+		header = append(header, "State", "Alias", "Index")
+	}
+	if showVendor {
+		header = append(header, "Mfg")
+	}
+	header = append(header, "Type", "Ports")
+	fmt.Fprintln(tw, strings.Join(header, "\t"))
 	for _, host := range report.Hosts {
-		var open []string
-		for _, port := range host.OpenPorts {
-			open = append(open, fmt.Sprintf("%d/%s", port.Port, port.Service))
+		openPorts := formatPortsDisplay(host.OpenPorts)
+		row := []string{
+			host.IP,
+			orDash(formatMAC(host.MAC, macFormat)),
+			formatLatencyDisplay(host.LatencyMS),
+			formatNameDisplay(host.Hostname),
 		}
-		hostname := orDash(host.Hostname)
+		if showStatus {
+			row = append(row, orDash(formatStatusDisplay(host.Status)))
+		}
+		if showARP {
+			row = append(row, formatARPState(host), formatARPAliasCell(host), formatARPIndex(host))
+		}
 		if showVendor {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", host.IP, hostname, orDash(host.MACVendor), host.Guess, strings.Join(open, ","))
-		} else {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", host.IP, hostname, host.Guess, strings.Join(open, ","))
+			row = append(row, formatVendorDisplay(host.MACVendor))
 		}
+		row = append(row, formatGuessDisplay(host.Guess), openPorts)
+		fmt.Fprintln(tw, strings.Join(row, "\t"))
 	}
 	_ = tw.Flush()
+}
+
+func formatMAC(mac, format string) string {
+	if mac == "" {
+		return ""
+	}
+	hex := strings.ToLower(macHexDigits(mac))
+	if len(hex) != 12 {
+		return mac
+	}
+	sep := ":"
+	switch format {
+	case "none":
+		return hex
+	case "dash":
+		sep = "-"
+	}
+	parts := []string{hex[0:2], hex[2:4], hex[4:6], hex[6:8], hex[8:10], hex[10:12]}
+	return strings.Join(parts, sep)
 }
 
 func orDash(value string) string {
