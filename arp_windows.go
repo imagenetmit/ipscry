@@ -15,10 +15,10 @@ const (
 )
 
 type mibIPNetRow struct {
-	dwAddr        uint32
+	dwIndex       uint32
 	dwPhysAddrLen uint32
 	bPhysAddr     [8]byte
-	dwIndex       uint32
+	dwAddr        uint32
 	dwType        uint32
 }
 

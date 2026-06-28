@@ -23,8 +23,8 @@ func TestParsePortsCommon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ports) != len(defaultPorts) {
-		t.Fatalf("got %d ports, want %d", len(ports), len(defaultPorts))
+	if len(ports) != len(defaultScanPorts) {
+		t.Fatalf("got %d ports, want %d", len(ports), len(defaultScanPorts))
 	}
 }
 
@@ -77,14 +77,14 @@ func TestParsePortsRejectsBadRange(t *testing.T) {
 }
 
 func TestNormalizeScanArgsAllowsFlagsAfterTarget(t *testing.T) {
-	flags, positional, err := normalizeScanArgs([]string{"192.168.1.0/24", "--timeout", "500ms", "--local"})
+	flags, positional, err := normalizeScanArgs([]string{"192.168.1.0/24", "--timeout", "500ms", "--arp-dead"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(positional) != 1 || positional[0] != "192.168.1.0/24" {
 		t.Fatalf("positional=%#v", positional)
 	}
-	want := []string{"--timeout", "500ms", "--local"}
+	want := []string{"--timeout", "500ms", "--arp-dead"}
 	for i := range want {
 		if flags[i] != want[i] {
 			t.Fatalf("flags[%d]=%q, want %q", i, flags[i], want[i])
@@ -93,14 +93,14 @@ func TestNormalizeScanArgsAllowsFlagsAfterTarget(t *testing.T) {
 }
 
 func TestNormalizeScanArgsShortFlags(t *testing.T) {
-	flags, positional, err := normalizeScanArgs([]string{"192.168.1.0/24", "-t", "500ms", "-l", "-c", "64"})
+	flags, positional, err := normalizeScanArgs([]string{"192.168.1.0/24", "-t", "500ms", "-a", "-c", "64"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(positional) != 1 || positional[0] != "192.168.1.0/24" {
 		t.Fatalf("positional=%#v", positional)
 	}
-	want := []string{"--timeout", "500ms", "--local", "--concurrency", "64"}
+	want := []string{"--timeout", "500ms", "--arp-dead", "--concurrency", "64"}
 	for i := range want {
 		if flags[i] != want[i] {
 			t.Fatalf("flags[%d]=%q, want %q", i, flags[i], want[i])
@@ -332,6 +332,53 @@ func TestExpandCIDRRejectsLargeAndNonIPv4(t *testing.T) {
 	}
 }
 
+func TestCidrUsableHostCount(t *testing.T) {
+	cases := []struct {
+		prefix int
+		want   int
+	}{
+		{24, 254},
+		{23, 510},
+		{22, 1022},
+	}
+	for _, tc := range cases {
+		if got := cidrUsableHostCount(tc.prefix); got != tc.want {
+			t.Fatalf("prefix /%d: got %d hosts, want %d", tc.prefix, got, tc.want)
+		}
+	}
+}
+
+func TestCheckTUINetworkSize(t *testing.T) {
+	t.Run("allows /24", func(t *testing.T) {
+		if err := checkTUINetworkSize("192.168.1.0/24", strings.NewReader(""), &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("rejects larger than /22", func(t *testing.T) {
+		err := checkTUINetworkSize("10.0.0.0/21", strings.NewReader(""), &bytes.Buffer{})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "larger than /22") {
+			t.Fatalf("error %q", err)
+		}
+	})
+	t.Run("/22 requires confirmation", func(t *testing.T) {
+		err := checkTUINetworkSize("10.0.0.0/22", strings.NewReader("n\n"), &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "cancelled") {
+			t.Fatalf("error %v", err)
+		}
+		if err := checkTUINetworkSize("10.0.0.0/22", strings.NewReader("y\n"), &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("/23 requires confirmation", func(t *testing.T) {
+		if err := checkTUINetworkSize("10.0.1.0/23", strings.NewReader("yes\n"), &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestParseScanArgsValidation(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -342,7 +389,6 @@ func TestParseScanArgsValidation(t *testing.T) {
 		{"low concurrency", []string{"192.168.1.0/24", "--concurrency", "0"}, "concurrency"},
 		{"high concurrency", []string{"192.168.1.0/24", "--concurrency", "9000"}, "concurrency"},
 		{"two targets", []string{"192.168.1.0/24", "10.0.0.0/24"}, "at most one"},
-		{"local plus cidr", []string{"--local", "192.168.1.0/24"}, "either --local"},
 		{"bad cidr", []string{"not-a-cidr"}, "invalid target CIDR"},
 	}
 	for _, tc := range cases {
@@ -377,11 +423,10 @@ func TestProgressDefaulting(t *testing.T) {
 		args []string
 		want bool
 	}{
-		{"on by default", []string{"192.168.1.0/24"}, true},
+		{"off when TUI default", []string{"192.168.1.0/24"}, false},
+		{"on with --no-tui", []string{"192.168.1.0/24", "--no-tui"}, true},
 		{"off when json set", []string{"192.168.1.0/24", "--json", "out.json"}, false},
 		{"off when log set", []string{"192.168.1.0/24", "--log", "out.log"}, false},
-		{"explicit on overrides json", []string{"192.168.1.0/24", "--json", "out.json", "--progress"}, true},
-		{"explicit off", []string{"192.168.1.0/24", "--progress=false"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -972,11 +1017,11 @@ func TestLessIP(t *testing.T) {
 }
 
 func TestStripHelpArgs(t *testing.T) {
-	args, help := stripHelpArgs([]string{"-h", "--local"})
+	args, help := stripHelpArgs([]string{"-h", "--ports", "web"})
 	if !help {
 		t.Fatal("expected help")
 	}
-	if len(args) != 1 || args[0] != "--local" {
+	if len(args) != 2 || args[0] != "--ports" || args[1] != "web" {
 		t.Fatalf("args=%v", args)
 	}
 	args, help = stripHelpArgs([]string{"192.168.1.0/24", "--help"})

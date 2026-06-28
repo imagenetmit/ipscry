@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -39,12 +40,6 @@ const (
 //
 //	go build -ldflags "-X main.appVersion=1.2.3"
 var appVersion = "0.1.0"
-
-var defaultPorts = []int{
-	21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445,
-	515, 554, 587, 631, 993, 995, 1433, 1883, 3306, 3389,
-	5432, 5900, 8000, 8008, 8080, 8443, 8883, 9100,
-}
 
 // portInfo is the single source of truth for a known port: its service label and
 // which application-layer probes apply. Adding a port is a one-line edit here.
@@ -99,7 +94,6 @@ var portCatalog = map[int]portInfo{
 
 type scanConfig struct {
 	Target        string
-	Local         bool
 	Ports         []int
 	Timeout       time.Duration
 	Concurrency   int
@@ -190,6 +184,11 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if cfg.TUI {
+		if err := checkTUINetworkSize(cfg.Target, os.Stdin, stderr); err != nil {
+			return err
+		}
+	}
 
 	logger, closeLog, err := configureLog(cfg.LogPath)
 	if err != nil {
@@ -222,7 +221,6 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		} else {
 			defer tui.Close()
 			monitor = tui
-			tui.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)))
 		}
 	}
 	if !cfg.TUI && cfg.Progress {
@@ -232,6 +230,9 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		snmpCommunity: cfg.SNMPCommunity,
 		arpCache:      cfg.ARPCache,
 		targetCIDR:    cfg.Target,
+	}
+	if tui != nil {
+		tui.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)), enrich)
 	}
 	hosts := scanNetwork(ctx, ips, cfg.Ports, cfg.Timeout, cfg.Concurrency, enrich, logger, progress, monitor)
 	completed := time.Now().UTC()
@@ -296,19 +297,16 @@ func stripHelpArgs(args []string) ([]string, bool) {
 
 func parseScanArgs(args []string) (scanConfig, error) {
 	cfg := scanConfig{
-		Ports:       append([]int(nil), defaultPorts...),
-		Timeout:     750 * time.Millisecond,
+		Ports:       append([]int(nil), defaultScanPorts...),
+		Timeout:     250 * time.Millisecond,
 		Concurrency: 1024,
 	}
 
 	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	local := fs.Bool("local", false, "scan active local /24")
 	ports := fs.String("ports", "common", "profile (common|web|windows|db), list, or ranges")
 	timeout := fs.Duration("timeout", cfg.Timeout, "TCP connect timeout")
 	concurrency := fs.Int("concurrency", cfg.Concurrency, "maximum concurrent port checks")
-	progress := fs.Bool("progress", false, "print scan progress to stderr")
-	tui := fs.Bool("tui", false, "force the live terminal UI")
 	noTUI := fs.Bool("no-tui", false, "disable the live terminal UI")
 	snmpCommunity := fs.String("snmp-community", "public", "SNMP v2c community for enrichment (empty to disable)")
 	jsonPath := fs.String("json", "", "write JSON results to path")
@@ -333,7 +331,6 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	cfg.Ports = parsedPorts
 	cfg.Timeout = *timeout
 	cfg.Concurrency = *concurrency
-	cfg.Local = *local
 	cfg.SNMPCommunity = *snmpCommunity
 	cfg.JSONPath = strings.TrimSpace(*jsonPath)
 	cfg.CSVPath = strings.TrimSpace(*csvPath)
@@ -349,27 +346,8 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	hasOutputPath := set["json"] || set["csv"] || set["log"]
 
-	// The live TUI is the default for interactive use. It is turned off by
-	// --no-tui, and auto-disabled when an output path is requested (typically
-	// unattended/NinjaRMM runs); --tui forces it back on. runScan additionally
-	// falls back to plain output when there is no interactive terminal.
-	switch {
-	case *noTUI:
-		cfg.TUI = false
-	case *tui:
-		cfg.TUI = true
-	default:
-		cfg.TUI = !hasOutputPath
-	}
-
-	// Progress (stderr) defaults on unless an output path was requested; an
-	// explicit --progress always wins. It is only emitted when the TUI is not
-	// active (see runScan), so the two never overlap.
-	if set["progress"] {
-		cfg.Progress = *progress
-	} else {
-		cfg.Progress = !hasOutputPath
-	}
+	cfg.TUI = !*noTUI && !hasOutputPath
+	cfg.Progress = !cfg.TUI && !hasOutputPath
 
 	if cfg.Timeout <= 0 {
 		return cfg, errors.New("timeout must be greater than zero")
@@ -387,12 +365,9 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	case len(positional) > 1:
 		return cfg, errors.New("accept at most one target CIDR")
 	case len(positional) == 1:
-		if cfg.Local {
-			return cfg, errors.New("provide either --local or an explicit CIDR, not both")
-		}
 		cfg.Target = positional[0]
 	default:
-		// No target given (with or without --local): scan the active local /24.
+		// No target given: scan the active local /24.
 		target, err := localCIDR()
 		if err != nil {
 			return cfg, err
@@ -408,12 +383,9 @@ func parseScanArgs(args []string) (scanConfig, error) {
 
 // scanFlagAliases maps single-letter flags to their long names.
 var scanFlagAliases = map[string]string{
-	"l": "local",
 	"p": "ports",
 	"t": "timeout",
 	"c": "concurrency",
-	"P": "progress",
-	"T": "tui",
 	"N": "no-tui",
 	"j": "json",
 	"C": "csv",
@@ -441,7 +413,7 @@ func normalizeFlagToken(arg string) (string, error) {
 	if long, ok := scanFlagAliases[body]; ok {
 		return "--" + long + suffix, nil
 	}
-	if scanValueFlags[body] || body == "local" || body == "progress" || body == "tui" || body == "no-tui" || body == "arp-dead" || body == "aip" {
+	if scanValueFlags[body] || body == "no-tui" || body == "arp-dead" || body == "aip" {
 		return "--" + body + suffix, nil
 	}
 	return "", fmt.Errorf("unknown flag %s", arg)
@@ -482,19 +454,15 @@ func printUsage(w io.Writer) {
 
 Usage:
   ipscry [CIDR] [options]
-  ipscry --local [options]
   ipscry version
 
 With no CIDR, scans the active local /24.
 
 Options:
   -h, --help
-  -l, --local
   -p, --ports common|web|windows|db | 22,80,443 | 8000-8100
-  -t, --timeout 750ms
+  -t, --timeout 250ms
   -c, --concurrency 1024
-  -P, --progress
-  -T, --tui             force the live terminal UI (on by default when interactive)
   -N, --no-tui          disable the live terminal UI
   -s, --snmp-community public
   -j, --json PATH       write JSON results (optional)
@@ -507,8 +475,8 @@ Options:
 }
 
 // portProfiles are named port sets selectable via --ports <name>.
+// "common" is not listed here; it always mirrors embedded data/ports.csv.
 var portProfiles = map[string][]int{
-	"common":  defaultPorts,
 	"web":     {80, 443, 631, 8000, 8008, 8080, 8443},
 	"windows": {135, 139, 445, 1433, 3389, 5985, 5986},
 	"db":      {1433, 3306, 5432},
@@ -517,9 +485,13 @@ var portProfiles = map[string][]int{
 func parsePorts(input string) ([]int, error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return append([]int(nil), defaultPorts...), nil
+		return append([]int(nil), defaultScanPorts...), nil
 	}
-	if profile, ok := portProfiles[strings.ToLower(input)]; ok {
+	lower := strings.ToLower(input)
+	if lower == "common" {
+		return append([]int(nil), defaultScanPorts...), nil
+	}
+	if profile, ok := portProfiles[lower]; ok {
 		out := append([]int(nil), profile...)
 		sort.Ints(out)
 		return out, nil
@@ -624,6 +596,85 @@ func isPrivateIPv4(ip net.IP) bool {
 		(ip[0] == 192 && ip[1] == 168)
 }
 
+const (
+	tuiMaxPrefix  = 22 // largest network allowed in TUI (/22 ≈ 1022 hosts)
+	tuiWarnPrefix = 23 // warn and confirm for /23 and /22
+)
+
+func cidrPrefixLen(cidr string) (int, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return 0, err
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 {
+		return 0, errors.New("only IPv4 CIDRs are supported")
+	}
+	return ones, nil
+}
+
+func cidrUsableHostCount(prefix int) int {
+	if prefix < 0 || prefix > 32 {
+		return 0
+	}
+	addrs := 1 << (32 - prefix)
+	if addrs <= 2 {
+		return 0
+	}
+	return addrs - 2
+}
+
+// checkTUINetworkSize rejects TUI scans larger than /22 and prompts before /22
+// or /23 scans because large result sets overwhelm the terminal UI.
+func checkTUINetworkSize(target string, stdin io.Reader, stderr io.Writer) error {
+	prefix, err := cidrPrefixLen(target)
+	if err != nil {
+		return fmt.Errorf("invalid target CIDR %q: %w", target, err)
+	}
+	if prefix > tuiWarnPrefix {
+		return nil
+	}
+	if prefix < tuiMaxPrefix {
+		return fmt.Errorf(
+			"TUI mode cannot scan networks larger than /22 (~%d hosts). "+
+				"Split the target into smaller chunks such as /24, /23, or /22, or run with --no-tui",
+			cidrUsableHostCount(tuiMaxPrefix),
+		)
+	}
+
+	hosts := cidrUsableHostCount(prefix)
+	fmt.Fprintf(stderr,
+		"Warning: scanning %s (~%d hosts) in TUI mode may overwhelm the terminal display.\n"+
+			"Consider splitting into /24 chunks, or use --no-tui for large scans.\n"+
+			"Continue? [y/N]: ",
+		target, hosts,
+	)
+	if f, ok := stdin.(*os.File); ok && !isTerminal(f) {
+		return errors.New("cannot confirm large TUI scan without an interactive terminal; use a smaller CIDR or --no-tui")
+	}
+	ok, err := confirmPrompt(stdin)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("scan cancelled")
+	}
+	return nil
+}
+
+func confirmPrompt(r io.Reader) (bool, error) {
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
 func expandCIDR(cidr string) ([]string, error) {
 	ip, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -659,6 +710,19 @@ func arpCacheForTarget(ipNet *net.IPNet) map[string]arpCacheEntry {
 		out[entry.IP] = entry
 	}
 	return out
+}
+
+func arpCacheEntryForIP(ip, targetCIDR string) (arpCacheEntry, bool) {
+	_, ipNet, err := net.ParseCIDR(targetCIDR)
+	if err != nil || !ipInTarget(ip, ipNet) {
+		return arpCacheEntry{}, false
+	}
+	for _, entry := range arpCacheEntries() {
+		if entry.IP == ip && validARPMAC(entry.MAC) {
+			return entry, true
+		}
+	}
+	return arpCacheEntry{}, false
 }
 
 func mergeARPCacheHosts(live map[string]struct{}, entries []arpCacheEntry, ipNet *net.IPNet) []arpCacheEntry {
@@ -823,8 +887,13 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	var hosts []hostResult
 	var hostMu sync.Mutex
 	var hostWorkers sync.WaitGroup
+	enrichIPs := make([]string, 0, len(byIP))
+	for ip := range byIP {
+		enrichIPs = append(enrichIPs, ip)
+	}
+	sort.Slice(enrichIPs, func(i, j int) bool { return lessIP(enrichIPs[i], enrichIPs[j]) })
 	if monitor != nil {
-		monitor.EnrichStart(len(byIP))
+		monitor.EnrichStart(enrichIPs, enrich)
 	}
 	for ip, openPorts := range byIP {
 		ip := ip
@@ -921,7 +990,7 @@ func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich e
 			guess = "offline"
 		}
 	}
-	return hostResult{
+	host := hostResult{
 		IP:         ip,
 		MAC:        mac,
 		MACVendor:  vendor,
@@ -936,6 +1005,8 @@ func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich e
 		Guess:      guess,
 		Status:     status,
 	}
+	fillARPFromCache(&host, enrich.targetCIDR)
+	return host
 }
 
 func shouldIncludeHost(openPorts []portResult, enrich enrichConfig, arpByIP map[string]arpCacheEntry, ip string) bool {
@@ -1912,6 +1983,17 @@ func applyARPFromCache(host *hostResult, entry arpCacheEntry) {
 	host.ARPIfAlias = entry.IfAlias
 	if entry.MAC != "" {
 		host.MAC = entry.MAC
+	}
+}
+
+func fillARPFromCache(host *hostResult, targetCIDR string) {
+	entry, ok := arpCacheEntryForIP(host.IP, targetCIDR)
+	if !ok {
+		return
+	}
+	applyARPFromCache(host, entry)
+	if host.MAC != "" && host.MACVendor == "" {
+		host.MACVendor = macVendor(host.MAC)
 	}
 }
 

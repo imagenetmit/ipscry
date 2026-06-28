@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
+	"unicode/utf8"
 )
 
 func TestProgressPercent(t *testing.T) {
@@ -86,12 +88,9 @@ func TestParseScanArgsTUI(t *testing.T) {
 		want bool
 	}{
 		{"on by default", []string{"192.168.1.0/24"}, true},
-		{"explicit --tui", []string{"192.168.1.0/24", "--tui"}, true},
-		{"-T alias", []string{"192.168.1.0/24", "-T"}, true},
 		{"--no-tui disables", []string{"192.168.1.0/24", "--no-tui"}, false},
 		{"-N alias disables", []string{"192.168.1.0/24", "-N"}, false},
 		{"auto-off with --json", []string{"192.168.1.0/24", "--json", "out.json"}, false},
-		{"--tui forces on over --json", []string{"192.168.1.0/24", "--json", "out.json", "--tui"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,10 +205,11 @@ func TestTuiLatencyColor(t *testing.T) {
 		host hostResult
 		want string
 	}{
-		{hostResult{LatencyMS: 10}, escGreen},
-		{hostResult{LatencyMS: 100}, escYellow},
+		{hostResult{LatencyMS: 10}, escBrightGreen},
+		{hostResult{LatencyMS: 100}, escGreen},
+		{hostResult{LatencyMS: 300}, escYellow},
 		{hostResult{LatencyMS: 500}, escRed},
-		{hostResult{LatencyMS: -1}, ""},
+		{hostResult{LatencyMS: -1}, escDim},
 		{hostResult{Status: "dead", LatencyMS: -1}, escRed},
 	}
 	for _, c := range cases {
@@ -230,14 +230,57 @@ func TestPadRight(t *testing.T) {
 
 func TestTuiDoneLayout(t *testing.T) {
 	lay := tuiDoneLayout(120, false)
-	if lay.typ < 10 || lay.ports < 14 || lay.name < 12 {
+	if lay.ports != tuiPortsWidth {
+		t.Fatalf("ports width = %d, want %d", lay.ports, tuiPortsWidth)
+	}
+	if lay.typ < 10 {
 		t.Fatalf("layout too tight: %+v", lay)
+	}
+	if lay.vendor != tuiVendorWidth || lay.name != tuiNameWidth {
+		t.Fatalf("vendor/name widths wrong: %+v", lay)
 	}
 	if lay.ip != 15 || lay.mac != 17 || lay.ms != 4 || lay.st != 1 {
 		t.Fatalf("fixed columns wrong: %+v", lay)
 	}
 	if lay.lmin != 4 || lay.lmax != 4 || lay.lavg != 4 {
 		t.Fatalf("min/max/avg columns wrong: %+v", lay)
+	}
+}
+
+func TestWrapPortTokens(t *testing.T) {
+	tokens := []string{"22", "80", "443", "3389", "5985", "8080"}
+	lines := wrapPortTokens(tokens, 25)
+	for _, line := range lines {
+		if utf8.RuneCountInString(line) > 25 {
+			t.Fatalf("line exceeds width 25: %q", line)
+		}
+	}
+	joined := strings.Join(lines, "|")
+	if !strings.Contains(joined, "22,80") {
+		t.Fatalf("expected first line to start with 22,80: %q", joined)
+	}
+	for _, line := range lines {
+		for _, part := range strings.Split(line, ",") {
+			if part == "" {
+				t.Fatalf("empty port token in line %q", line)
+			}
+		}
+	}
+	// A single port longer than the width stays intact on one line.
+	long := wrapPortTokens([]string{"65535"}, 3)
+	if len(long) != 1 || long[0] != "65535" {
+		t.Fatalf("single token should not split: %v", long)
+	}
+}
+
+func TestFormatTuiNameDisplay(t *testing.T) {
+	long := strings.Repeat("x", 40)
+	got := formatTuiNameDisplay(long)
+	if len(got) != tuiNameWidth {
+		t.Fatalf("len=%d want %d: %q", len(got), tuiNameWidth, got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("expected ellipsis truncation: %q", got)
 	}
 }
 
@@ -307,11 +350,70 @@ func TestExportRequiresResultsPhase(t *testing.T) {
 	}
 }
 
+func TestHostRowPending(t *testing.T) {
+	if !hostRowPending(hostResult{IP: "10.0.0.1", LatencyMS: 5}) {
+		t.Fatal("port-open placeholder should be pending")
+	}
+	if hostRowPending(hostResult{IP: "10.0.0.1", MAC: "aa:bb:cc:dd:ee:ff", Guess: "windows"}) {
+		t.Fatal("enriched host should not be pending")
+	}
+}
+
+func TestHostReadyReplacesPlaceholder(t *testing.T) {
+	tui := &scanTUI{out: io.Discard, pingStats: map[string]*hostPingStats{}}
+	tui.upsertPlaceholderLocked("10.0.0.5", 12)
+	tui.HostReady(hostResult{IP: "10.0.0.5", MAC: "aa:bb:cc:dd:ee:ff", LatencyMS: 12, Guess: "windows"})
+	if len(tui.hosts) != 1 {
+		t.Fatalf("hosts=%d, want 1", len(tui.hosts))
+	}
+	if tui.hosts[0].MAC == "" || hostRowPending(tui.hosts[0]) {
+		t.Fatalf("placeholder not replaced: %+v", tui.hosts[0])
+	}
+}
+
+func TestCycleMacFormat(t *testing.T) {
+	if got := cycleMacFormat("colon"); got != "dash" {
+		t.Fatalf("colon -> %q", got)
+	}
+	if got := cycleMacFormat("dash"); got != "none" {
+		t.Fatalf("dash -> %q", got)
+	}
+	if got := cycleMacFormat("none"); got != "colon" {
+		t.Fatalf("none -> %q", got)
+	}
+	if got := cycleMacFormat(""); got != "dash" {
+		t.Fatalf("empty -> %q", got)
+	}
+}
+
+func TestCycleMacFormatHotkey(t *testing.T) {
+	tui := &scanTUI{
+		out:   io.Discard,
+		watch: tuiWatchConfig{macFormat: "colon"},
+	}
+	tui.cycleMacFormat()
+	if tui.watch.macFormat != "dash" {
+		t.Fatalf("macFormat=%q, want dash", tui.watch.macFormat)
+	}
+}
+
+func TestTriggerRescanIgnoresWhenBusy(t *testing.T) {
+	tui := &scanTUI{
+		out:   io.Discard,
+		phase: "scanning",
+		watch: tuiWatchConfig{ips: []string{"10.0.0.1"}, ports: []int{80}},
+	}
+	tui.triggerRescan(context.Background())
+	if tui.rescanning {
+		t.Fatal("should not start rescan while already scanning")
+	}
+}
+
 func TestReadKey(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader(
-		"cq\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOAk \x1b[1;5A\x1b[3~"))
+		"mrcq\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOAk \x1b[1;5A\x1b[3~"))
 	want := []tuiKey{
-		keyCSV, keyExit, keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom,
+		keyMacFormat, keyRescan, keyCSV, keyExit, keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom,
 		keyUp, keyUp, keyPageDown, keyTop, keyNone,
 	}
 	for i, w := range want {

@@ -28,6 +28,9 @@ const (
 	tuiExportStatusTTL      = 4 * time.Second
 	tuiDeadAfterMisses      = 10
 	tuiPingAvgWindow        = 6
+	tuiNameWidth            = 22
+	tuiVendorWidth          = 18
+	tuiPortsWidth           = 25
 )
 
 var spinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
@@ -76,10 +79,10 @@ type tuiWatchConfig struct {
 }
 
 type scanMonitor interface {
-	Start(target string, totalPorts int64)
+	Start(target string, totalPorts int64, enrich enrichConfig)
 	PortProgress(scanned, total int64)
 	PortOpen(ip string, latencyMS int64)
-	EnrichStart(hostCount int)
+	EnrichStart(ips []string, enrich enrichConfig)
 	HostReady(host hostResult)
 	Finish(hosts []hostResult, elapsed time.Duration, ctx context.Context, watch tuiWatchConfig)
 	Close()
@@ -113,6 +116,7 @@ type scanTUI struct {
 	watchChunkTotal  int
 	pendingDiscover  sync.Map
 	discoverSem      chan struct{}
+	rescanning       bool
 	done             chan struct{}
 	pulse            chan struct{}
 	once             sync.Once
@@ -164,9 +168,10 @@ func (t *scanTUI) scheduleDraw() {
 	}
 }
 
-func (t *scanTUI) Start(target string, totalPorts int64) {
+func (t *scanTUI) Start(target string, totalPorts int64, enrich enrichConfig) {
 	t.mu.Lock()
 	t.target = target
+	t.watch.enrich = enrich
 	t.mu.Unlock()
 	t.total.Store(totalPorts)
 	t.scheduleDraw()
@@ -183,24 +188,70 @@ func (t *scanTUI) PortOpen(ip string, latencyMS int64) {
 	t.mu.Lock()
 	if prev, ok := t.scanHosts[ip]; !ok || latencyMS < prev {
 		t.scanHosts[ip] = latencyMS
+		latencyMS = t.scanHosts[ip]
+	} else {
+		latencyMS = prev
 	}
+	t.upsertPlaceholderLocked(ip, latencyMS)
 	t.mu.Unlock()
 	t.scheduleDraw()
 }
 
-func (t *scanTUI) EnrichStart(hostCount int) {
+func (t *scanTUI) EnrichStart(ips []string, enrich enrichConfig) {
 	t.mu.Lock()
 	t.phase = "enriching"
-	t.hostTotal = hostCount
+	t.hostTotal = len(ips)
+	t.watch.enrich = enrich
+	for _, ip := range ips {
+		ms := int64(-1)
+		if v, ok := t.scanHosts[ip]; ok {
+			ms = v
+		}
+		t.upsertPlaceholderLocked(ip, ms)
+	}
 	t.mu.Unlock()
 	t.scheduleDraw()
 }
 
 func (t *scanTUI) HostReady(host hostResult) {
 	t.mu.Lock()
+	for i := range t.hosts {
+		if t.hosts[i].IP == host.IP {
+			t.hosts[i] = host
+			if host.LatencyMS >= 0 {
+				t.recordPingLocked(host.IP, host.LatencyMS)
+			}
+			t.mu.Unlock()
+			t.scheduleDraw()
+			return
+		}
+	}
 	t.hosts = append(t.hosts, host)
+	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
+	if host.LatencyMS >= 0 {
+		t.recordPingLocked(host.IP, host.LatencyMS)
+	}
 	t.mu.Unlock()
 	t.scheduleDraw()
+}
+
+func (t *scanTUI) upsertPlaceholderLocked(ip string, latencyMS int64) {
+	for i := range t.hosts {
+		if t.hosts[i].IP != ip {
+			continue
+		}
+		if latencyMS >= 0 && (t.hosts[i].LatencyMS < 0 || latencyMS < t.hosts[i].LatencyMS) {
+			t.hosts[i].LatencyMS = latencyMS
+		}
+		return
+	}
+	t.hosts = append(t.hosts, hostResult{IP: ip, LatencyMS: latencyMS})
+	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
+}
+
+func hostRowPending(host hostResult) bool {
+	return host.MAC == "" && host.Hostname == "" && host.Guess == "" &&
+		host.MACVendor == "" && len(host.OpenPorts) == 0
 }
 
 func (t *scanTUI) Finish(hosts []hostResult, elapsed time.Duration, ctx context.Context, watch tuiWatchConfig) {
@@ -271,6 +322,10 @@ func (t *scanTUI) runFastProbe(ctx context.Context) {
 		return
 	}
 	t.mu.Lock()
+	if t.rescanning {
+		t.mu.Unlock()
+		return
+	}
 	watch := t.watch
 	var suspects []string
 	for ip, s := range t.pingStats {
@@ -326,6 +381,10 @@ func (t *scanTUI) runPingTick(ctx context.Context) {
 		return
 	}
 	t.mu.Lock()
+	if t.rescanning {
+		t.mu.Unlock()
+		return
+	}
 	watch := t.watch
 	known := make(map[string]struct{}, len(t.hosts))
 	for _, host := range t.hosts {
@@ -361,6 +420,22 @@ func (t *scanTUI) runPingTick(ctx context.Context) {
 	now := time.Now()
 	changed := false
 	for i := range t.hosts {
+		if entry, ok := arpByIP[t.hosts[i].IP]; ok {
+			before := t.hosts[i]
+			applyARPFromCache(&t.hosts[i], entry)
+			if before.ARPType != t.hosts[i].ARPType ||
+				before.ARPIfIndex != t.hosts[i].ARPIfIndex ||
+				before.ARPIfAlias != t.hosts[i].ARPIfAlias ||
+				before.MAC != t.hosts[i].MAC {
+				changed = true
+			}
+			if t.hosts[i].MAC != "" && t.hosts[i].MACVendor == "" {
+				t.hosts[i].MACVendor = macVendor(t.hosts[i].MAC)
+				changed = true
+			}
+		}
+	}
+	for i := range t.hosts {
 		ip := t.hosts[i].IP
 		if _, inBatch := batchSet[ip]; !inBatch {
 			continue
@@ -381,10 +456,6 @@ func (t *scanTUI) runPingTick(ctx context.Context) {
 			// fastLoop own escalation from here. Already-suspect hosts are skipped
 			// so the 5s sweep can't double-count their misses.
 			t.recordMissLocked(ip)
-			changed = true
-		}
-		if entry, ok := arpByIP[ip]; ok {
-			applyARPFromCache(&t.hosts[i], entry)
 			changed = true
 		}
 		if t.watchPopulated && hostStateChanged(before, t.hosts[i]) {
@@ -415,18 +486,13 @@ func (t *scanTUI) discoverHostAsync(ctx context.Context, watch tuiWatchConfig, i
 	if _, loaded := t.pendingDiscover.LoadOrStore(ip, struct{}{}); loaded {
 		return
 	}
-	if latencyMS >= 0 {
-		t.upsertHost(hostResult{IP: ip, LatencyMS: latencyMS, Status: "live"})
-	}
+	t.addDiscoverPlaceholder(ip, latencyMS)
 	go func() {
 		defer t.pendingDiscover.Delete(ip)
 		t.discoverSem <- struct{}{}
 		defer func() { <-t.discoverSem }()
 		openPorts := scanIPPorts(ctx, ip, watch.ports, watch.timeout, watch.concurrency)
 		if !shouldIncludeHost(openPorts, watch.enrich, arpByIP, ip) {
-			if latencyMS >= 0 {
-				return
-			}
 			t.removeHost(ip)
 			return
 		}
@@ -442,6 +508,27 @@ func (t *scanTUI) discoverHostAsync(ctx context.Context, watch tuiWatchConfig, i
 		}
 		t.upsertHost(host)
 	}()
+}
+
+func (t *scanTUI) addDiscoverPlaceholder(ip string, latencyMS int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.indexOfLocked(ip) >= 0 {
+		return
+	}
+	status := ""
+	if latencyMS >= 0 {
+		status = "live"
+	}
+	if t.phase == "watch" {
+		t.hostDiscoveredAt[ip] = time.Now()
+	}
+	t.hosts = append(t.hosts, hostResult{IP: ip, LatencyMS: latencyMS, Status: status})
+	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
+	if latencyMS >= 0 {
+		t.recordPingLocked(ip, latencyMS)
+	}
+	t.scheduleDraw()
 }
 
 func (t *scanTUI) upsertHost(host hostResult) {
@@ -524,16 +611,51 @@ func tuiLatencyColor(host hostResult) string {
 		return escRed
 	}
 	if host.LatencyMS < 0 {
-		return ""
+		return escDim
 	}
 	switch {
 	case host.LatencyMS <= 20:
-		return escGreen
+		return escBrightGreen
 	case host.LatencyMS <= 150:
+		return escGreen
+	case host.LatencyMS <= 400:
 		return escYellow
 	default:
 		return escRed
 	}
+}
+
+func statusGlyphColor(host hostResult, phase string, now time.Time, discoveredAt map[string]time.Time, misses int) string {
+	if tuiIsNewHost(host, phase, now, discoveredAt) {
+		return escBrightGreen
+	}
+	if host.Status == "dead" {
+		return escRed
+	}
+	if misses >= 1 {
+		return escYellow
+	}
+	if host.LatencyMS >= 0 || len(host.OpenPorts) > 0 {
+		return escGreen
+	}
+	return escDim
+}
+
+func hostIPColor(host hostResult) string {
+	if host.Status == "dead" {
+		return escRed
+	}
+	if len(host.OpenPorts) > 0 || host.LatencyMS >= 0 {
+		return escBrightCyan
+	}
+	return escCyan
+}
+
+func portsCellColor(host hostResult) string {
+	if len(host.OpenPorts) > 0 {
+		return escMagenta
+	}
+	return ""
 }
 
 // hostStateChanged reports a meaningful change worth highlighting: a status
@@ -751,6 +873,10 @@ func (t *scanTUI) WaitExit(ctx context.Context) {
 				t.doExport("json")
 			case keyTXT:
 				t.doExport("txt")
+			case keyRescan:
+				t.triggerRescan(ctx)
+			case keyMacFormat:
+				t.cycleMacFormat()
 			case keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom:
 				t.scroll(k)
 			}
@@ -767,6 +893,8 @@ const (
 	keyCSV
 	keyJSON
 	keyTXT
+	keyRescan
+	keyMacFormat
 	keyUp
 	keyDown
 	keyPageUp
@@ -791,6 +919,10 @@ func readKey(r *bufio.Reader) (tuiKey, error) {
 		return keyJSON, nil
 	case 't', 'T':
 		return keyTXT, nil
+	case 'r', 'R':
+		return keyRescan, nil
+	case 'm', 'M':
+		return keyMacFormat, nil
 	case 'k':
 		return keyUp, nil
 	case 'g':
@@ -877,6 +1009,10 @@ func lineCommand(line string) tuiKey {
 		return keyJSON
 	case 't', 'T':
 		return keyTXT
+	case 'r', 'R':
+		return keyRescan
+	case 'm', 'M':
+		return keyMacFormat
 	}
 	return keyNone
 }
@@ -920,6 +1056,94 @@ func (t *scanTUI) scroll(kind tuiKey) {
 	if t.scrollOff < 0 {
 		t.scrollOff = 0
 	}
+	t.mu.Unlock()
+	t.scheduleDraw()
+}
+
+// triggerRescan runs a full port scan using the current watch config and replaces
+// the host table when complete. Watch ping/discovery is paused until then.
+func (t *scanTUI) triggerRescan(ctx context.Context) {
+	t.mu.Lock()
+	if t.rescanning || t.phase == "scanning" || t.phase == "enriching" {
+		t.mu.Unlock()
+		return
+	}
+	if t.phase != "watch" && t.phase != "done" {
+		t.mu.Unlock()
+		return
+	}
+	watch := t.watch
+	total := int64(len(watch.ips) * len(watch.ports))
+	t.rescanning = true
+	t.phase = "scanning"
+	t.hosts = nil
+	t.scanHosts = map[string]int64{}
+	t.hostTotal = 0
+	t.scrollOff = 0
+	t.pingStats = map[string]*hostPingStats{}
+	t.hostDiscoveredAt = map[string]time.Time{}
+	t.hostChangedAt = map[string]time.Time{}
+	t.watchPopulated = false
+	t.scanned.Store(0)
+	t.total.Store(total)
+	t.mu.Unlock()
+	t.scheduleDraw()
+
+	go func() {
+		started := time.Now()
+		hosts := scanNetwork(ctx, watch.ips, watch.ports, watch.timeout, watch.concurrency, watch.enrich, watch.logger, nil, t)
+		t.applyRescanResults(hosts, time.Since(started), watch)
+	}()
+}
+
+func (t *scanTUI) applyRescanResults(hosts []hostResult, elapsed time.Duration, watch tuiWatchConfig) {
+	sort.Slice(hosts, func(i, j int) bool { return lessIP(hosts[i].IP, hosts[j].IP) })
+	t.mu.Lock()
+	t.rescanning = false
+	t.phase = "watch"
+	t.elapsed = elapsed
+	t.hosts = append([]hostResult(nil), hosts...)
+	t.hostTotal = len(hosts)
+	for i := range t.hosts {
+		if t.hosts[i].LatencyMS >= 0 {
+			t.recordPingLocked(t.hosts[i].IP, t.hosts[i].LatencyMS)
+		}
+	}
+	t.mu.Unlock()
+	if watch.logger != nil {
+		watch.logger.Printf("tui rescan completed hosts=%d duration=%s", len(hosts), elapsed)
+	}
+	t.scheduleDraw()
+}
+
+func cycleMacFormat(current string) string {
+	switch current {
+	case "dash":
+		return "none"
+	case "none":
+		return "colon"
+	default:
+		return "dash"
+	}
+}
+
+func macFormatStatusLabel(format string) string {
+	switch format {
+	case "dash":
+		return "MAC format: dash (aa-bb-cc-dd-ee-ff)"
+	case "none":
+		return "MAC format: none (aabbccddeeff)"
+	default:
+		return "MAC format: colon (aa:bb:cc:dd:ee:ff)"
+	}
+}
+
+func (t *scanTUI) cycleMacFormat() {
+	t.mu.Lock()
+	t.watch.macFormat = cycleMacFormat(t.watch.macFormat)
+	t.exportStatus = macFormatStatusLabel(t.watch.macFormat)
+	t.exportErr = false
+	t.exportStatusAt = time.Now()
 	t.mu.Unlock()
 	t.scheduleDraw()
 }
@@ -1017,13 +1241,19 @@ func (t *scanTUI) draw() {
 	chunkNum := t.watchChunkNum
 	chunkTotal := t.watchChunkTotal
 	smallNet := t.smallNet
-	scanHosts := make(map[string]int64, len(t.scanHosts))
-	for ip, ms := range t.scanHosts {
-		scanHosts[ip] = ms
-	}
 	hosts := append([]hostResult(nil), t.hosts...)
 	scrollOff := t.scrollOff
-	showARP := t.watch.enrich.arpCache
+	hostsReady := 0
+	for _, host := range hosts {
+		if !hostRowPending(host) {
+			hostsReady++
+		}
+	}
+	showARP := true
+	macFormat := t.watch.macFormat
+	if macFormat == "" {
+		macFormat = "colon"
+	}
 	exportStatus := ""
 	exportErr := false
 	if t.exportStatus != "" && time.Since(t.exportStatusAt) < tuiExportStatusTTL {
@@ -1040,8 +1270,10 @@ func (t *scanTUI) draw() {
 		for ip, ts := range t.hostChangedAt {
 			changedAt[ip] = ts
 		}
-	}
-	if phase == "watch" || phase == "done" {
+		for ip, s := range t.pingStats {
+			pingView[ip] = hostPingView{misses: s.misses, min: s.min, max: s.max, avg: s.avg()}
+		}
+	} else if phase == "scanning" || phase == "enriching" || phase == "done" {
 		for ip, s := range t.pingStats {
 			pingView[ip] = hostPingView{misses: s.misses, min: s.min, max: s.max, avg: s.avg()}
 		}
@@ -1057,24 +1289,28 @@ func (t *scanTUI) draw() {
 	if phase == "scanning" || phase == "enriching" || phase == "watch" {
 		spin = "  " + escCyan + spinnerFrame(frame) + escReset
 	}
-	fmt.Fprintf(&b, "%s%s%s %s%s  ·  %s  ·  %s%s\n\n",
-		escBold, appName, escReset, appVersion, escDim, target, phaseLabel(phase), spin)
+	fmt.Fprintf(&b, "%s%s%s%s %s%s  ·  %s%s%s  ·  %s\n\n",
+		escBrightCyan, escBold, appName, escReset,
+		escDim, appVersion,
+		escYellow, target, escReset,
+		phaseLabel(phase)+spin)
 
 	if phase == "watch" {
 		fmt.Fprintf(&b, "%d hosts · scan %s · watching\n\n", len(hosts), elapsed.Round(time.Millisecond))
 	} else if phase == "done" {
 		fmt.Fprintf(&b, "%d hosts  ·  %s\n\n", len(hosts), elapsed.Round(time.Millisecond))
 	} else {
-		fmt.Fprintf(&b, "%s\n\n", formatScanProgress(cols, scanned, total, len(scanHosts), phase, hostTotal, len(hosts)))
+		fmt.Fprintf(&b, "%s\n\n", formatScanProgress(cols, scanned, total, len(hosts), phase, hostTotal, hostsReady))
 	}
 
 	switch phase {
-	case "scanning":
-		t.drawScanRows(&b, scanHosts, cols, rows)
-	case "enriching":
-		t.drawHostRows(&b, hosts, hostTotal, cols, rows, true, false, phase, discoveredAt, changedAt, pingView, now, frame, 0)
-	case "watch", "done":
-		t.drawHostRows(&b, hosts, 0, cols, rows, false, showARP, phase, discoveredAt, changedAt, pingView, now, frame, scrollOff)
+	case "scanning", "enriching", "watch", "done":
+		rowScroll := scrollOff
+		if phase == "scanning" || phase == "enriching" {
+			rowScroll = 0
+		}
+		showEnrichProgress := phase == "enriching"
+		t.drawHostRows(&b, hosts, hostTotal, cols, rows, showARP, phase, discoveredAt, changedAt, pingView, now, frame, rowScroll, macFormat, showEnrichProgress)
 	}
 
 	b.WriteString("\n")
@@ -1083,7 +1319,7 @@ func (t *scanTUI) draw() {
 		if !smallNet {
 			ping = fmt.Sprintf("ping chunk %d/%d every %ds", chunkNum, chunkTotal, int(tuiWatchInterval.Seconds()))
 		}
-		fmt.Fprintf(&b, "%sq quit · c csv · j json · t txt · %s%s\n", escDim, ping, escReset)
+		fmt.Fprintf(&b, "%sr rescan · m mac · q quit · c csv · j json · t txt · %s%s\n", escDim, ping, escReset)
 		if exportStatus != "" {
 			color := escGreen
 			if exportErr {
@@ -1091,7 +1327,8 @@ func (t *scanTUI) draw() {
 			}
 			fmt.Fprintf(&b, "%s%s%s", color, exportStatus, escReset)
 		} else {
-			fmt.Fprintf(&b, "%s● up · ! missing · ○ down · + new · min/max/avg ms%s", escDim, escReset)
+			fmt.Fprintf(&b, "%s●%s up · %s!%s missing · %s○%s down · %s+%s new · min/max/avg ms%s",
+				escGreen, escDim, escYellow, escDim, escRed, escDim, escBrightGreen, escDim, escReset)
 		}
 	} else {
 		fmt.Fprintf(&b, "%sCtrl+C to cancel%s", escDim, escReset)
@@ -1101,88 +1338,137 @@ func (t *scanTUI) draw() {
 	_, _ = io.WriteString(t.out, escHome+frame2+escClearDown)
 }
 
-func (t *scanTUI) drawScanRows(b *strings.Builder, scanHosts map[string]int64, cols, rows int) {
-	lay := tuiScanLayout(cols)
-	b.WriteString(escBold)
-	fmt.Fprintf(b, "%-*s %-*s\n", lay.ip, "IP", lay.ms, "ms")
-	b.WriteString(escReset)
-	ips := sortedIPs(scanHosts)
-	maxRows := rows - 7
-	if maxRows < 1 {
-		maxRows = 1
-	}
-	if len(ips) > maxRows {
-		ips = ips[len(ips)-maxRows:]
-	}
-	for _, ip := range ips {
-		fmt.Fprintf(b, "%-*s %-*s\n", lay.ip, ip, lay.ms, formatLatencyDisplay(scanHosts[ip]))
-	}
-}
-
 type tuiColLayout struct {
-	st, ip, mac, ms, lmin, lmax, lavg, typ, arpState, arpAlias, arpIndex, ports, name int
-}
-
-func tuiScanLayout(cols int) tuiColLayout {
-	ip, ms := 15, 3
-	if cols < ip+ms+2 {
-		ip = cols - ms - 2
-		if ip < 10 {
-			ip = 10
-		}
-	}
-	return tuiColLayout{ip: ip, ms: ms}
-}
-
-func tuiEnrichLayout(cols int) tuiColLayout {
-	ip, mac, ms := 15, 17, 3
-	name := cols - ip - mac - ms - 3
-	if name < 16 {
-		name = 16
-	}
-	return tuiColLayout{ip: ip, mac: mac, ms: ms, name: name}
+	st, ip, mac, ms, lmin, lmax, lavg, typ, vendor, arpState, arpAlias, arpIndex, ports, name int
 }
 
 func tuiDoneLayout(cols int, showARP bool) tuiColLayout {
 	st, ip, mac, ms, typ := 1, 15, 17, 4, 10
-	lmin, lmax, lavg := 4, 4, 4 // min/max/avg latency, capped at 9999ms
+	lmin, lmax, lavg := 4, 4, 4
+	vendor, name := tuiVendorWidth, tuiNameWidth
 	arpState, arpAlias, arpIndex := 0, 0, 0
-	gaps := 8 // st ip mac ms min max avg typ ports name -> 9 gaps; ports/name share rest
 	if showARP {
 		arpState, arpAlias, arpIndex = 11, 14, 5
-		gaps = 11
-	}
-	overhead := st + ip + mac + ms + lmin + lmax + lavg + typ + arpState + arpAlias + arpIndex + gaps
-	rest := cols - overhead
-	if rest < 26 {
-		rest = 26
-	}
-	ports := rest * 2 / 5
-	if ports < 14 {
-		ports = 14
-	}
-	if ports > 44 {
-		ports = 44
-	}
-	name := rest - ports
-	if name < 12 {
-		name = 12
-		if ports > rest-name {
-			ports = rest - name
-		}
 	}
 	return tuiColLayout{
 		st: st, ip: ip, mac: mac, ms: ms, lmin: lmin, lmax: lmax, lavg: lavg, typ: typ,
-		arpState: arpState, arpAlias: arpAlias, arpIndex: arpIndex,
-		ports: ports, name: name,
+		vendor: vendor, arpState: arpState, arpAlias: arpAlias, arpIndex: arpIndex,
+		ports: tuiPortsWidth, name: name,
 	}
 }
 
-func (t *scanTUI) drawHostRows(b *strings.Builder, hosts []hostResult, hostTotal, cols, rows int, enriching, showARP bool, phase string, discoveredAt, changedAt map[string]time.Time, pingView map[string]hostPingView, now time.Time, frame int64, scrollOff int) {
+func formatTuiVendorDisplay(vendor string) string {
+	return truncDisplay(formatVendorDisplay(vendor), tuiVendorWidth)
+}
+
+func formatTuiNameDisplay(name string) string {
+	return truncDisplay(orDash(name), tuiNameWidth)
+}
+
+func tuiDashCell(width int) string {
+	return padRight("-", width)
+}
+
+func tuiMACCell(host hostResult, macFormat string, width int) string {
+	if hostRowPending(host) || host.MAC == "" {
+		return tuiDashCell(width)
+	}
+	return padRight(trunc(orDash(formatMAC(host.MAC, macFormat)), width), width)
+}
+
+func tuiGuessCell(host hostResult, width int) string {
+	if hostRowPending(host) || host.Guess == "" {
+		return tuiDashCell(width)
+	}
+	return padRight(formatGuessDisplay(host.Guess), width)
+}
+
+func tuiPortsCell(host hostResult, width int) string {
+	if hostRowPending(host) {
+		return tuiDashCell(width)
+	}
+	lines := tuiPortsLines(host)
+	return padRight(lines[0], width)
+}
+
+// tuiPortsLines wraps comma-separated port numbers at width display columns without
+// splitting individual port values across lines.
+func tuiPortsLines(host hostResult) []string {
+	if hostRowPending(host) || len(host.OpenPorts) == 0 {
+		return []string{"-"}
+	}
+	tokens := make([]string, len(host.OpenPorts))
+	for i, p := range host.OpenPorts {
+		tokens[i] = strconv.Itoa(p.Port)
+	}
+	return wrapPortTokens(tokens, tuiPortsWidth)
+}
+
+func wrapPortTokens(tokens []string, width int) []string {
+	if len(tokens) == 0 {
+		return []string{"-"}
+	}
+	if width <= 0 {
+		width = tuiPortsWidth
+	}
+	var lines []string
+	var b strings.Builder
+	lineLen := 0
+	for _, tok := range tokens {
+		tokLen := utf8.RuneCountInString(tok)
+		need := tokLen
+		if lineLen > 0 {
+			need++ // comma separator
+		}
+		if lineLen > 0 && lineLen+need > width {
+			lines = append(lines, b.String())
+			b.Reset()
+			lineLen = 0
+		}
+		if lineLen > 0 {
+			b.WriteByte(',')
+			lineLen++
+		}
+		b.WriteString(tok)
+		lineLen += tokLen
+	}
+	if b.Len() > 0 {
+		lines = append(lines, b.String())
+	}
+	return lines
+}
+
+func tuiBlankCell(width int) string {
+	return padRight("", width)
+}
+
+func tuiVendorCell(host hostResult, width int) string {
+	if hostRowPending(host) || host.MACVendor == "" {
+		return tuiDashCell(width)
+	}
+	return padRight(formatTuiVendorDisplay(host.MACVendor), width)
+}
+
+func tuiNameCell(host hostResult, width int) string {
+	if hostRowPending(host) || host.Hostname == "" {
+		return tuiDashCell(width)
+	}
+	return padRight(formatTuiNameDisplay(host.Hostname), width)
+}
+
+func tuiARPCell(host hostResult, width int, value func(hostResult) string) string {
+	if hostRowPending(host) && host.ARPType == "" && host.ARPIfIndex == 0 && host.ARPIfAlias == "" {
+		return tuiDashCell(width)
+	}
+	return padRight(value(host), width)
+}
+
+func (t *scanTUI) drawHostRows(b *strings.Builder, hosts []hostResult, hostTotal, cols, rows int, showARP bool, phase string, discoveredAt, changedAt map[string]time.Time, pingView map[string]hostPingView, now time.Time, frame int64, scrollOff int, macFormat string, showProgress bool) {
 	maxRows := tuiMaxHostRows(rows)
 	total := len(hosts)
 	off := 0
-	if !enriching && total > maxRows {
+	allowScroll := phase == "watch" || phase == "done"
+	if allowScroll && total > maxRows {
 		off = scrollOff
 		if maxOff := total - maxRows; off > maxOff {
 			off = maxOff
@@ -1196,82 +1482,121 @@ func (t *scanTUI) drawHostRows(b *strings.Builder, hosts []hostResult, hostTotal
 		view = hosts[off : off+maxRows]
 	}
 
-	if enriching {
-		lay := tuiEnrichLayout(cols)
-		b.WriteString(escBold)
-		fmt.Fprintf(b, "%-*s %-*s %-*s %s\n", lay.ip, "IP", lay.mac, "MAC", lay.ms, "ms", "Name")
-		b.WriteString(escReset)
-		for _, host := range view {
-			fmt.Fprintf(b, "%-*s %-*s %-*s %s\n",
-				lay.ip, host.IP,
-				lay.mac, trunc(orDash(formatMAC(host.MAC, "colon")), lay.mac),
-				lay.ms, tuiLatencyDisplay(host.LatencyMS),
-				truncDisplay(orDash(host.Hostname), lay.name),
-			)
-		}
+	lay := tuiDoneLayout(cols, showARP)
+	b.WriteString(escBold + escBrightCyan)
+	if showARP {
+		fmt.Fprintf(b, "%-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s\n",
+			lay.st, "S", lay.ip, "IP", lay.mac, "MAC", lay.ms, "ms",
+			lay.lmin, "min", lay.lmax, "max", lay.lavg, "avg", lay.typ, "Type",
+			lay.arpState, "State", lay.arpAlias, "Alias", lay.arpIndex, "Index",
+			lay.ports, "Ports", lay.vendor, "Vendor", lay.name, "Name")
 	} else {
-		lay := tuiDoneLayout(cols, showARP)
-		b.WriteString(escBold)
-		if showARP {
-			fmt.Fprintf(b, "%-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %s\n",
-				lay.st, "S", lay.ip, "IP", lay.mac, "MAC", lay.ms, "ms",
-				lay.lmin, "min", lay.lmax, "max", lay.lavg, "avg", lay.typ, "Type",
-				lay.arpState, "State", lay.arpAlias, "Alias", lay.arpIndex, "Index",
-				lay.ports, "Ports", "Name")
-		} else {
-			fmt.Fprintf(b, "%-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %s\n",
-				lay.st, "S", lay.ip, "IP", lay.mac, "MAC", lay.ms, "ms",
-				lay.lmin, "min", lay.lmax, "max", lay.lavg, "avg",
-				lay.typ, "Type", lay.ports, "Ports", "Name")
+		fmt.Fprintf(b, "%-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s\n",
+			lay.st, "S", lay.ip, "IP", lay.mac, "MAC", lay.ms, "ms",
+			lay.lmin, "min", lay.lmax, "max", lay.lavg, "avg",
+			lay.typ, "Type", lay.ports, "Ports", lay.vendor, "Vendor", lay.name, "Name")
+	}
+	b.WriteString(escReset)
+	for _, host := range view {
+		pv := pingView[host.IP]
+		prefix, reset := tuiRowColor(host, now, changedAt)
+		stCell := padRight(tuiStatusGlyph(host, phase, now, discoveredAt, pv.misses), lay.st)
+		ipCell := padRight(host.IP, lay.ip)
+		stCell = wrapCell(stCell, statusGlyphColor(host, phase, now, discoveredAt, pv.misses), prefix)
+		ipCell = wrapCell(ipCell, hostIPColor(host), prefix)
+		msText := latencyCellText(host, pv.misses)
+		if hostRowPending(host) && host.LatencyMS < 0 && pv.misses == 0 {
+			msText = "-"
 		}
-		b.WriteString(escReset)
-		for _, host := range view {
-			pv := pingView[host.IP]
-			prefix, reset := tuiRowColor(host, now, changedAt)
-			stCell := padRight(tuiStatusGlyph(host, phase, now, discoveredAt, pv.misses), lay.st)
-			ipCell := padRight(host.IP, lay.ip)
-			if tuiIsNewHost(host, phase, now, discoveredAt) {
-				stCell = wrapCell(stCell, escGreen, prefix)
-				ipCell = wrapCell(ipCell, escGreen, prefix)
+		msCell := wrapCell(padRight(msText, lay.ms), latencyCellColor(host, pv.misses), prefix)
+		macCell := tuiMACCell(host, macFormat, lay.mac)
+		if !hostRowPending(host) && host.MAC != "" {
+			macCell = wrapCell(macCell, escMagenta, prefix)
+		}
+		typCell := wrapCell(tuiGuessCell(host, lay.typ), escYellow, prefix)
+		if hostRowPending(host) {
+			typCell = wrapCell(typCell, escDim, prefix)
+		}
+		vendorCell := tuiVendorCell(host, lay.vendor)
+		if host.MACVendor != "" {
+			vendorCell = wrapCell(vendorCell, escBlue, prefix)
+		} else if hostRowPending(host) {
+			vendorCell = wrapCell(vendorCell, escDim, prefix)
+		}
+		nameCell := tuiNameCell(host, lay.name)
+		if host.Hostname != "" {
+			nameCell = wrapCell(nameCell, escBlue, prefix)
+		} else if hostRowPending(host) {
+			nameCell = wrapCell(nameCell, escDim, prefix)
+		}
+		minCell := tuiDashCell(lay.lmin)
+		maxCell := tuiDashCell(lay.lmax)
+		avgCell := tuiDashCell(lay.lavg)
+		if !hostRowPending(host) {
+			minCell = padRight(formatStatMS(pv.min), lay.lmin)
+			maxCell = padRight(formatStatMS(pv.max), lay.lmax)
+			avgCell = padRight(formatStatMS(pv.avg), lay.lavg)
+		}
+		portLines := tuiPortsLines(host)
+		for li, portLine := range portLines {
+			portsCell := wrapCell(padRight(portLine, lay.ports), portsCellColor(host), prefix)
+			if hostRowPending(host) {
+				portsCell = wrapCell(portsCell, escDim, prefix)
 			}
-			msCell := wrapCell(padRight(latencyCellText(host, pv.misses), lay.ms), latencyCellColor(host, pv.misses), prefix)
 			b.WriteString(prefix)
+			if li == 0 {
+				if showARP {
+					fmt.Fprintf(b, "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",
+						stCell, ipCell, macCell, msCell,
+						minCell, maxCell, avgCell,
+						typCell,
+						tuiARPCell(host, lay.arpState, formatARPState),
+						tuiARPCell(host, lay.arpAlias, func(h hostResult) string { return truncDisplay(formatARPAlias(h), lay.arpAlias) }),
+						tuiARPCell(host, lay.arpIndex, formatARPIndex),
+						portsCell, vendorCell, nameCell,
+						reset,
+					)
+				} else {
+					fmt.Fprintf(b, "%s %s %s %s %s %s %s %s %s %s %s %s\n",
+						stCell, ipCell, macCell, msCell,
+						minCell, maxCell, avgCell,
+						typCell, portsCell, vendorCell, nameCell,
+						reset,
+					)
+				}
+				continue
+			}
 			if showARP {
-				fmt.Fprintf(b, "%s %s %-*s %s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %s%s\n",
-					stCell, ipCell,
-					lay.mac, trunc(orDash(formatMAC(host.MAC, "colon")), lay.mac),
-					msCell,
-					lay.lmin, formatStatMS(pv.min),
-					lay.lmax, formatStatMS(pv.max),
-					lay.lavg, formatStatMS(pv.avg),
-					lay.typ, formatGuessDisplay(host.Guess),
-					lay.arpState, formatARPState(host),
-					lay.arpAlias, truncDisplay(formatARPAlias(host), lay.arpAlias),
-					lay.arpIndex, formatARPIndex(host),
-					lay.ports, truncDisplay(formatPortsDisplay(host.OpenPorts), lay.ports),
-					truncDisplay(orDash(host.Hostname), lay.name),
+				fmt.Fprintf(b, "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",
+					tuiBlankCell(lay.st), tuiBlankCell(lay.ip), tuiBlankCell(lay.mac), tuiBlankCell(lay.ms),
+					tuiBlankCell(lay.lmin), tuiBlankCell(lay.lmax), tuiBlankCell(lay.lavg),
+					tuiBlankCell(lay.typ),
+					tuiBlankCell(lay.arpState), tuiBlankCell(lay.arpAlias), tuiBlankCell(lay.arpIndex),
+					portsCell, tuiBlankCell(lay.vendor), tuiBlankCell(lay.name),
 					reset,
 				)
 			} else {
-				fmt.Fprintf(b, "%s %s %-*s %s %-*s %-*s %-*s %-*s %-*s %s%s\n",
-					stCell, ipCell,
-					lay.mac, trunc(orDash(formatMAC(host.MAC, "colon")), lay.mac),
-					msCell,
-					lay.lmin, formatStatMS(pv.min),
-					lay.lmax, formatStatMS(pv.max),
-					lay.lavg, formatStatMS(pv.avg),
-					lay.typ, formatGuessDisplay(host.Guess),
-					lay.ports, truncDisplay(formatPortsDisplay(host.OpenPorts), lay.ports),
-					truncDisplay(orDash(host.Hostname), lay.name),
+				fmt.Fprintf(b, "%s %s %s %s %s %s %s %s %s %s %s %s\n",
+					tuiBlankCell(lay.st), tuiBlankCell(lay.ip), tuiBlankCell(lay.mac), tuiBlankCell(lay.ms),
+					tuiBlankCell(lay.lmin), tuiBlankCell(lay.lmax), tuiBlankCell(lay.lavg),
+					tuiBlankCell(lay.typ), portsCell, tuiBlankCell(lay.vendor), tuiBlankCell(lay.name),
 					reset,
 				)
 			}
 		}
 	}
-	if enriching && hostTotal > len(hosts) {
-		fmt.Fprintf(b, "\n%sresolving %d/%d hosts… %s%s\n", escDim, len(hosts), hostTotal, spinnerFrame(frame), escReset)
+	if showProgress && hostTotal > 0 {
+		ready := 0
+		for _, host := range hosts {
+			if !hostRowPending(host) {
+				ready++
+			}
+		}
+		if ready < hostTotal {
+			fmt.Fprintf(b, "\n%sresolving %d/%d hosts… %s%s\n", escDim, ready, hostTotal, spinnerFrame(frame), escReset)
+		}
 	}
-	if !enriching && total > maxRows {
+	if allowScroll && total > maxRows {
 		fmt.Fprintf(b, "\n%sshowing %d-%d of %d  ·  %d above · %d below  ·  ↑/↓ or k, Space/b page, g/G ends%s\n",
 			escDim, off+1, off+len(view), total, off, total-off-len(view), escReset)
 	}
@@ -1280,13 +1605,13 @@ func (t *scanTUI) drawHostRows(b *strings.Builder, hosts []hostResult, hostTotal
 func phaseLabel(phase string) string {
 	switch phase {
 	case "scanning":
-		return escCyan + "scanning" + escReset
+		return escBrightCyan + "scanning" + escReset
 	case "enriching":
 		return escYellow + "enriching" + escReset
 	case "watch":
-		return escCyan + "watching" + escReset
+		return escBrightGreen + "watching" + escReset
 	case "done":
-		return escGreen + "complete" + escReset
+		return escBrightGreen + "complete" + escReset
 	default:
 		return phase
 	}
@@ -1353,7 +1678,10 @@ func progressBar(done, total int64, width int) string {
 	b.WriteByte('[')
 	b.WriteString(escReset)
 	if filled > 0 {
-		b.WriteString(escCyan)
+		b.WriteString(escBrightCyan)
+		if filled >= width {
+			b.WriteString(escBrightGreen)
+		}
 		b.WriteString(strings.Repeat("█", filled))
 		b.WriteString(escReset)
 	}

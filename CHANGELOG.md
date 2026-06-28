@@ -10,6 +10,11 @@ for tagged releases.
 
 ### Changed
 
+- TUI mode rejects targets larger than `/22` and prompts for confirmation on `/23`
+  and `/22` scans because large result sets overwhelm the terminal UI.
+- Removed redundant CLI flags `--local`, `--progress`, and `--tui`; local /24 is
+  the default target, stderr progress and the TUI are chosen automatically, and
+  `-N`/`--no-tui` remains the explicit TUI opt-out.
 - Embedded static port-service and MAC vendor datasets replace external API lookups.
   MAC vendor enrichment is now always on (offline, local subnet only).
 - Removed the `--mac-vendor` flag; vendor lookup uses embedded OUI data.

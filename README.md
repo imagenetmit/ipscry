@@ -66,21 +66,24 @@ Pass `-j`, `-C`, and/or `-L` with paths when you want artifacts on disk. NinjaRM
 (or other unattended runners) typically sets all three — for example:
 
 ```powershell
-C:\imagenet\ipscry.exe scan --timeout 750ms --json C:\imagenet\scan.json --csv C:\imagenet\scan.csv --log C:\imagenet\scan.log
+C:\imagenet\ipscry.exe scan --json C:\imagenet\scan.json --csv C:\imagenet\scan.csv --log C:\imagenet\scan.log
 ```
 
 ## Live terminal UI
 
 When run interactively, `ipscry` shows a live terminal UI (TUI) by default: a
 real-time scan progress bar, a results table, ongoing host watch, scrollable host
-list (arrows / PageUp / PageDown / Home / End), and in-UI export (`c` CSV, `j`
-JSON, `t` TXT). Press Enter to exit.
+list (arrows / PageUp / PageDown / Home / End), in-UI export (`c` CSV, `j`
+JSON, `t` TXT), and full re-scan (`r`). Press Enter to exit.
 
 The TUI is **automatically disabled** when an output path (`-j`, `-C`, or `-L`) is
 requested or when there is no interactive terminal (piped/unattended runs), so RMM
-and automation behavior is unchanged. Use `-N`/`--no-tui` to force it off, or
-`-T`/`--tui` to force it on even when writing artifacts. Set `NO_COLOR` to disable
-ANSI colors.
+and automation behavior is unchanged. Use `-N`/`--no-tui` to disable it explicitly.
+Set `NO_COLOR` to disable ANSI colors.
+
+TUI mode is limited to `/22` and smaller targets (about 1022 hosts). `/23` and
+`/22` scans prompt for confirmation first; larger networks are rejected with a
+message to split the scan into `/24`, `/23`, or `/22` chunks or use `--no-tui`.
 
 ### Watch behaviour and latency stats
 
@@ -91,20 +94,19 @@ a `-` (flagged `!` in the status column) and it is re-probed once per second; th
 cell fades progressively redder with each consecutive miss and the host is marked
 `down` after 10 misses (~10s). A single successful reply resets it to the 5s sweep.
 
-Default ports:
-
-```text
-21,22,23,25,53,80,110,135,139,143,443,445,
-515,554,587,631,993,995,1433,1883,3306,3389,
-5432,5900,8000,8008,8080,8443,8883,9100
-```
-
 ## Port selection
 
-`--ports` accepts a named profile, an explicit list, or ranges:
+By default (or with `--ports common`), ipscry scans every port listed in the
+embedded [`data/ports.csv`](data/ports.csv) — currently **92 ports** from 20 through
+28017 (FTP, SSH, HTTP/S, SMB, RDP, databases, dev/alternate bindings, and similar).
+That file is the single source of truth for both the default scan set and the
+service/vendor metadata compiled into the binary. Edit it and rebuild to change
+defaults.
+
+`--ports` also accepts named profiles, an explicit list, or ranges:
 
 ```text
---ports common          # the default set above
+--ports common          # all ports in data/ports.csv (default)
 --ports web             # 80,443,631,8000,8008,8080,8443
 --ports windows         # 135,139,445,1433,3389,5985,5986
 --ports db              # 1433,3306,5432
@@ -112,8 +114,8 @@ Default ports:
 --ports 8000-8100,9100  # ranges plus single ports
 ```
 
-Progress prints to stderr during interactive scans (on by default). It stays off
-when `-j`, `-C`, or `-L` is set unless you pass `-P` explicitly.
+Progress prints to stderr during non-TUI interactive scans. It stays off when the
+TUI is active or when `-j`, `-C`, or `-L` is set.
 
 ## Name resolution
 
@@ -134,15 +136,18 @@ Each discovered host on the **local subnet** is enriched with its hardware MAC
 address (via Windows `SendARP`) and the vendor that owns the OUI. Lookups use an
 embedded IEEE OUI database — fully offline, no API calls.
 
-- MAC addresses are only available for hosts on the local subnet (the default
-  `--local` case). Routed hosts reached via an explicit CIDR will have no MAC.
+- MAC addresses are only available for hosts on the local subnet when scanning
+  the active local /24 (the default with no CIDR). Routed hosts reached via an
+  explicit CIDR will have no MAC.
 - Vendor names appear in JSON/CSV output and in the console table when known.
 
 ## Port metadata
 
 Open ports include embedded service labels and common software/product names
-(`vendors` field in JSON/CSV). Data is compiled into the binary from
-`data/ports.csv`.
+(`vendors` field in JSON/CSV). Labels and the default scan port list both come
+from [`data/ports.csv`](data/ports.csv). Application-layer probes (HTTP headers,
+TLS certificates, banners) still use probe flags in `main.go` for ports that need
+them; other listed ports get a plain TCP connect check.
 
 To regenerate the MAC vendor blob after updating the IEEE export:
 

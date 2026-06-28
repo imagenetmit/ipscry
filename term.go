@@ -20,19 +20,24 @@ const (
 // Color/attribute SGR codes are vars so NO_COLOR can blank them at startup
 // while leaving cursor/screen-control sequences intact.
 var (
-	escBold    = "\033[1m"
-	escDim     = "\033[2m"
-	escReverse = "\033[7m"
-	escCyan    = "\033[36m"
-	escGreen   = "\033[32m"
-	escYellow  = "\033[33m"
-	escRed     = "\033[31m"
+	escBold        = "\033[1m"
+	escDim         = "\033[2m"
+	escReverse     = "\033[7m"
+	escBlue        = "\033[34m"
+	escMagenta     = "\033[35m"
+	escCyan        = "\033[36m"
+	escGreen       = "\033[32m"
+	escYellow      = "\033[33m"
+	escRed         = "\033[31m"
+	escBrightGreen = "\033[92m"
+	escBrightCyan  = "\033[96m"
 )
 
 func init() {
 	if _, ok := os.LookupEnv("NO_COLOR"); ok {
 		escBold, escDim, escReverse = "", "", ""
-		escCyan, escGreen, escYellow, escRed = "", "", "", ""
+		escBlue, escMagenta, escCyan, escGreen, escYellow, escRed = "", "", "", "", "", ""
+		escBrightGreen, escBrightCyan = "", ""
 	}
 }
 

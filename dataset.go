@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	_ "embed"
 	"encoding/csv"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +24,10 @@ type portEntry struct {
 	vendors string
 }
 
-var portsByNumber map[int]portEntry
+var (
+	portsByNumber    map[int]portEntry
+	defaultScanPorts []int
+)
 
 var (
 	macVendorsOnce sync.Once
@@ -34,6 +38,16 @@ var (
 
 func init() {
 	portsByNumber = parsePortsCSV(embeddedPortsCSV)
+	defaultScanPorts = sortedPortKeys(portsByNumber)
+}
+
+func sortedPortKeys(m map[int]portEntry) []int {
+	ports := make([]int, 0, len(m))
+	for port := range m {
+		ports = append(ports, port)
+	}
+	sort.Ints(ports)
+	return ports
 }
 
 func parsePortsCSV(data []byte) map[int]portEntry {

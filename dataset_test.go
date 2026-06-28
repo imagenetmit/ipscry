@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func TestDefaultScanPortsFromCSV(t *testing.T) {
+	if len(defaultScanPorts) != len(portsByNumber) {
+		t.Fatalf("defaultScanPorts has %d entries, portsByNumber has %d", len(defaultScanPorts), len(portsByNumber))
+	}
+	for i := 1; i < len(defaultScanPorts); i++ {
+		if defaultScanPorts[i] <= defaultScanPorts[i-1] {
+			t.Fatalf("defaultScanPorts not sorted at %d: %d after %d", i, defaultScanPorts[i], defaultScanPorts[i-1])
+		}
+	}
+	if defaultScanPorts[0] != 20 || defaultScanPorts[len(defaultScanPorts)-1] != 28017 {
+		t.Fatalf("unexpected defaultScanPorts range: first=%d last=%d", defaultScanPorts[0], defaultScanPorts[len(defaultScanPorts)-1])
+	}
+}
+
 func TestServiceLabel(t *testing.T) {
 	if got := serviceLabel(80); got != "http" {
 		t.Fatalf("serviceLabel(80)=%q, want http", got)
