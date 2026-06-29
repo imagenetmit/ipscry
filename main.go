@@ -106,6 +106,7 @@ type scanConfig struct {
 	MACFormat     string
 	ARPCache      bool
 	AIP           bool
+	TUIARPDetail  bool
 }
 
 type scanReport struct {
@@ -230,6 +231,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		snmpCommunity: cfg.SNMPCommunity,
 		arpCache:      cfg.ARPCache,
 		targetCIDR:    cfg.Target,
+		tuiARPDetail:  cfg.TUIARPDetail,
 	}
 	if tui != nil {
 		tui.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)), enrich)
@@ -314,6 +316,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	logPath := fs.String("log", "", "write audit log to path")
 	macFormat := fs.String("mac-format", "colon", "MAC format: colon, none, dash")
 	arpCache := fs.Bool("arp-dead", false, "include IPs from the local ARP cache with no open ports")
+	arpDetail := fs.Bool("arp-detail", false, "show ARP State/Alias/Index columns in the TUI")
 	aipView := fs.Bool("aip", false, "display results like Advanced IP Scanner")
 
 	normalizedArgs, positional, err := normalizeScanArgs(args)
@@ -337,6 +340,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	cfg.LogPath = strings.TrimSpace(*logPath)
 	cfg.MACFormat = strings.ToLower(strings.TrimSpace(*macFormat))
 	cfg.ARPCache = *arpCache
+	cfg.TUIARPDetail = *arpDetail
 	cfg.AIP = *aipView
 	if cfg.AIP {
 		cfg.ARPCache = true
@@ -392,6 +396,7 @@ var scanFlagAliases = map[string]string{
 	"L": "log",
 	"m": "mac-format",
 	"a": "arp-dead",
+	"R": "arp-detail",
 	"s": "snmp-community",
 }
 
@@ -413,7 +418,7 @@ func normalizeFlagToken(arg string) (string, error) {
 	if long, ok := scanFlagAliases[body]; ok {
 		return "--" + long + suffix, nil
 	}
-	if scanValueFlags[body] || body == "no-tui" || body == "arp-dead" || body == "aip" {
+	if scanValueFlags[body] || body == "no-tui" || body == "arp-dead" || body == "arp-detail" || body == "aip" {
 		return "--" + body + suffix, nil
 	}
 	return "", fmt.Errorf("unknown flag %s", arg)
@@ -470,6 +475,7 @@ Options:
   -L, --log PATH        write audit log (optional)
   -m, --mac-format colon|none|dash
   -a, --arp-dead        include offline hosts from the local ARP cache
+  -R, --arp-detail      show ARP State/Alias/Index columns in the TUI
       --aip             Advanced IP Scanner-style results table
 `, appName, appVersion)
 }
@@ -782,6 +788,7 @@ type enrichConfig struct {
 	snmpCommunity string
 	arpCache      bool
 	targetCIDR    string
+	tuiARPDetail  bool
 }
 
 func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Duration, concurrency int, enrich enrichConfig, logger *log.Logger, progress io.Writer, monitor scanMonitor) []hostResult {

@@ -233,43 +233,35 @@ func TestTuiDoneLayout(t *testing.T) {
 	if lay.ports != tuiPortsWidth {
 		t.Fatalf("ports width = %d, want %d", lay.ports, tuiPortsWidth)
 	}
-	if lay.typ < 10 {
-		t.Fatalf("layout too tight: %+v", lay)
-	}
 	if lay.vendor != tuiVendorWidth || lay.name != tuiNameWidth {
 		t.Fatalf("vendor/name widths wrong: %+v", lay)
 	}
-	if lay.ip != 15 || lay.mac != 17 || lay.ms != 4 || lay.st != 1 {
+	if lay.st != 1 || lay.ip != 15 || lay.mac != 17 || lay.ms != 4 {
 		t.Fatalf("fixed columns wrong: %+v", lay)
 	}
-	if lay.lmin != 4 || lay.lmax != 4 || lay.lavg != 4 {
+	if lay.lmin != 3 || lay.lmax != 3 || lay.lavg != 3 {
 		t.Fatalf("min/max/avg columns wrong: %+v", lay)
+	}
+	if lay.arpState != 0 || lay.arpAlias != 0 || lay.arpIndex != 0 {
+		t.Fatalf("arp columns should be hidden by default: %+v", lay)
+	}
+	layARP := tuiDoneLayout(120, true)
+	if layARP.arpState != 11 || layARP.arpAlias != 14 || layARP.arpIndex != 5 {
+		t.Fatalf("arp columns wrong with --arp-detail: %+v", layARP)
 	}
 }
 
-func TestWrapPortTokens(t *testing.T) {
-	tokens := []string{"22", "80", "443", "3389", "5985", "8080"}
-	lines := wrapPortTokens(tokens, 25)
-	for _, line := range lines {
-		if utf8.RuneCountInString(line) > 25 {
-			t.Fatalf("line exceeds width 25: %q", line)
-		}
+func TestTuiPortsCellTruncates(t *testing.T) {
+	var ports []portResult
+	for p := 20; p <= 120; p++ {
+		ports = append(ports, portResult{Port: p})
 	}
-	joined := strings.Join(lines, "|")
-	if !strings.Contains(joined, "22,80") {
-		t.Fatalf("expected first line to start with 22,80: %q", joined)
+	got := tuiPortsCell(hostResult{OpenPorts: ports}, tuiPortsWidth)
+	if utf8.RuneCountInString(strings.TrimSpace(got)) > tuiPortsWidth {
+		t.Fatalf("ports cell wider than %d: %q", tuiPortsWidth, got)
 	}
-	for _, line := range lines {
-		for _, part := range strings.Split(line, ",") {
-			if part == "" {
-				t.Fatalf("empty port token in line %q", line)
-			}
-		}
-	}
-	// A single port longer than the width stays intact on one line.
-	long := wrapPortTokens([]string{"65535"}, 3)
-	if len(long) != 1 || long[0] != "65535" {
-		t.Fatalf("single token should not split: %v", long)
+	if !strings.Contains(got, "...") {
+		t.Fatalf("expected truncated ports: %q", got)
 	}
 }
 
@@ -284,11 +276,22 @@ func TestFormatTuiNameDisplay(t *testing.T) {
 	}
 }
 
-func TestTuiDoneLayoutTypFitsGuess(t *testing.T) {
-	lay := tuiDoneLayout(80, false)
-	guess := formatGuessDisplay("linux/device")
-	if len(guess) > lay.typ {
-		t.Fatalf("typ width %d smaller than guess %q", lay.typ, guess)
+func TestToggleAutoPing(t *testing.T) {
+	tui := &scanTUI{autoPing: true}
+	tui.toggleAutoPing()
+	if tui.autoPing {
+		t.Fatal("expected auto-ping off")
+	}
+	if tui.exportStatus != "auto-ping off" {
+		t.Fatalf("status=%q", tui.exportStatus)
+	}
+}
+
+func TestToggleAutoScan(t *testing.T) {
+	tui := &scanTUI{}
+	tui.toggleAutoScan()
+	if !tui.autoScan {
+		t.Fatal("expected auto-scan on")
 	}
 }
 
@@ -411,9 +414,9 @@ func TestTriggerRescanIgnoresWhenBusy(t *testing.T) {
 
 func TestReadKey(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader(
-		"mrcq\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOAk \x1b[1;5A\x1b[3~"))
+		"mrcqps\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOAk \x1b[1;5A\x1b[3~"))
 	want := []tuiKey{
-		keyMacFormat, keyRescan, keyCSV, keyExit, keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom,
+		keyMacFormat, keyRescan, keyCSV, keyExit, keyAutoPing, keyAutoScan, keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom,
 		keyUp, keyUp, keyPageDown, keyTop, keyNone,
 	}
 	for i, w := range want {

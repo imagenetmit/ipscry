@@ -24,6 +24,8 @@
 - Port `vendors` appear in JSON and CSV output; console table keeps compact `port/service` cells.
 - Optional stdlib-only TUI is on by default for interactive runs; disable with `-N` / `--no-tui` (`tui.go`, `term.go`).
 - TUI mode blocks targets larger than `/22`; `/23` and `/22` require interactive confirmation.
+- TUI hides ARP State/Alias/Index columns by default; enable with `-R` / `--arp-detail`.
+- TUI watch: `p` toggles auto-ping (default on); `s` toggles auto-scan every 3m (default off).
 - Default port-scan concurrency is 1024 (CLI-valid range 1–2048).
 - Console table column order is IP, MAC, Latency, then Hostname; MAC format defaults to colon-separated (`--mac-format colon|none|dash`).
 - Designed for authorized local network inventory and on-demand RMM deployment, with conservative AV/EDR posture.

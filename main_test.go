@@ -379,6 +379,16 @@ func TestCheckTUINetworkSize(t *testing.T) {
 	})
 }
 
+func TestParseScanArgsARPDetail(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "-R"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TUIARPDetail {
+		t.Fatal("expected --arp-detail enabled")
+	}
+}
+
 func TestParseScanArgsValidation(t *testing.T) {
 	cases := []struct {
 		name  string

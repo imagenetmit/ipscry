@@ -74,7 +74,8 @@ C:\imagenet\ipscry.exe scan --json C:\imagenet\scan.json --csv C:\imagenet\scan.
 When run interactively, `ipscry` shows a live terminal UI (TUI) by default: a
 real-time scan progress bar, a results table, ongoing host watch, scrollable host
 list (arrows / PageUp / PageDown / Home / End), in-UI export (`c` CSV, `j`
-JSON, `t` TXT), and full re-scan (`r`). Press Enter to exit.
+JSON, `t` TXT), full re-scan (`r`), and watch toggles: `p` auto-ping, `s`
+auto-scan (background rescan every 3 minutes). Press Enter to exit.
 
 The TUI is **automatically disabled** when an output path (`-j`, `-C`, or `-L`) is
 requested or when there is no interactive terminal (piped/unattended runs), so RMM
@@ -85,14 +86,21 @@ TUI mode is limited to `/22` and smaller targets (about 1022 hosts). `/23` and
 `/22` scans prompt for confirmation first; larger networks are rejected with a
 message to split the scan into `/24`, `/23`, or `/22` chunks or use `--no-tui`.
 
+Use `-R`/`--arp-detail` to show ARP neighbor **State**, **Alias**, and **Index**
+columns in the TUI (hidden by default).
+
 ### Watch behaviour and latency stats
 
 During watch the table shows per-host `min`/`max`/`avg` latency (avg is a moving
-average of the last 6 successful pings). Responsive hosts are pinged on a relaxed
-5s sweep. When a host that was responding **misses one ping**, its `ms` cell shows
-a `-` (flagged `!` in the status column) and it is re-probed once per second; the
-cell fades progressively redder with each consecutive miss and the host is marked
-`down` after 10 misses (~10s). A single successful reply resets it to the 5s sweep.
+average of the last 6 successful pings) while **auto-ping** is on (toggle with
+`p`; on by default). Responsive hosts are pinged on a relaxed 5s sweep. When a
+host that was responding **misses one ping**, its `ms` cell shows a `-` (flagged
+`!` in the status column) and it is re-probed once per second; the cell fades
+progressively redder with each consecutive miss and the host is marked `down`
+after 10 misses (~10s). A single successful reply resets it to the 5s sweep.
+
+**Auto-scan** (`s` toggle; off by default) runs a full background rescan every
+3 minutes. Manual `r` still triggers an immediate rescan.
 
 ## Port selection
 
