@@ -73,6 +73,7 @@ type tuiWatchConfig struct {
 	ports       []int
 	timeout     time.Duration
 	concurrency int
+	httpTimeout time.Duration
 	enrich      enrichConfig
 	logger      *log.Logger
 	macFormat   string
@@ -85,6 +86,7 @@ type scanMonitor interface {
 	PortOpen(ip string, latencyMS int64)
 	EnrichStart(ips []string, enrich enrichConfig)
 	HostReady(host hostResult)
+	HTTPRefresh(updated hostResult)
 	Finish(hosts []hostResult, elapsed time.Duration, ctx context.Context, watch tuiWatchConfig)
 	Close()
 }
@@ -236,6 +238,39 @@ func (t *scanTUI) HostReady(host hostResult) {
 	}
 	t.mu.Unlock()
 	t.scheduleDraw()
+}
+
+// HTTPRefresh merges a second-pass HTTP/HTTPS page retrieval into an existing
+// host row. It only fills ports that still lack an HTTP response, so a stale
+// probe from a prior scan generation can never clobber a port a newer scan has
+// already populated. Missing hosts (cleared by a rescan) are dropped silently.
+func (t *scanTUI) HTTPRefresh(updated hostResult) {
+	t.mu.Lock()
+	i := t.indexOfLocked(updated.IP)
+	if i < 0 {
+		t.mu.Unlock()
+		return
+	}
+	changed := false
+	for _, np := range updated.OpenPorts {
+		for j := range t.hosts[i].OpenPorts {
+			if t.hosts[i].OpenPorts[j].Port != np.Port {
+				continue
+			}
+			if t.hosts[i].OpenPorts[j].HTTPStatus == "" && np.HTTPStatus != "" {
+				t.hosts[i].OpenPorts[j] = np
+				changed = true
+			}
+			break
+		}
+	}
+	if changed {
+		t.hostChangedAt[updated.IP] = time.Now()
+	}
+	t.mu.Unlock()
+	if changed {
+		t.scheduleDraw()
+	}
 }
 
 func (t *scanTUI) upsertPlaceholderLocked(ip string, latencyMS int64) {
@@ -1144,7 +1179,7 @@ func (t *scanTUI) triggerRescan(ctx context.Context) {
 
 	go func() {
 		started := time.Now()
-		hosts := scanNetwork(ctx, watch.ips, watch.ports, watch.timeout, watch.concurrency, watch.enrich, watch.logger, nil, t)
+		hosts := scanNetwork(ctx, watch.ips, watch.ports, watch.timeout, watch.concurrency, watch.httpTimeout, watch.enrich, watch.logger, nil, t)
 		t.applyRescanResults(hosts, time.Since(started), watch)
 	}()
 }

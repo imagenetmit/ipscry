@@ -20,3 +20,5 @@ mac-vendors-export.json
 .cursor/plans/embed_ports_and_mac_data_4da2adf3.plan.md
 security_tcp_ports_extended_http_dev.csv
 neighbor.csv
+endpoints.json
+endpoints.csv

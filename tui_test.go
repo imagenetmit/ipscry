@@ -91,6 +91,7 @@ func TestParseScanArgsTUI(t *testing.T) {
 		{"--no-tui disables", []string{"192.168.1.0/24", "--no-tui"}, false},
 		{"-N alias disables", []string{"192.168.1.0/24", "-N"}, false},
 		{"auto-off with --json", []string{"192.168.1.0/24", "--json", "out.json"}, false},
+		{"auto-off with --webhook", []string{"192.168.1.0/24", "--webhook", "https://example.com/hook"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -371,6 +372,66 @@ func TestHostReadyReplacesPlaceholder(t *testing.T) {
 	}
 	if tui.hosts[0].MAC == "" || hostRowPending(tui.hosts[0]) {
 		t.Fatalf("placeholder not replaced: %+v", tui.hosts[0])
+	}
+}
+
+func TestHTTPRefreshFillsEmptyPort(t *testing.T) {
+	tui := &scanTUI{
+		out:           io.Discard,
+		pingStats:     map[string]*hostPingStats{},
+		hostChangedAt: map[string]time.Time{},
+	}
+	tui.hosts = []hostResult{{
+		IP:        "10.0.0.5",
+		LatencyMS: 8,
+		OpenPorts: []portResult{
+			{Port: 80, Service: "http"},
+			{Port: 22, Service: "ssh", Banner: "OpenSSH"},
+		},
+	}}
+
+	tui.HTTPRefresh(hostResult{
+		IP: "10.0.0.5",
+		OpenPorts: []portResult{
+			{Port: 80, Service: "http", HTTPStatus: "200 OK", HTTPTitle: "Lab"},
+		},
+	})
+
+	if tui.hosts[0].OpenPorts[0].HTTPStatus != "200 OK" {
+		t.Fatalf("http status=%q, want 200 OK", tui.hosts[0].OpenPorts[0].HTTPStatus)
+	}
+	if tui.hosts[0].OpenPorts[0].HTTPTitle != "Lab" {
+		t.Fatalf("title=%q, want Lab", tui.hosts[0].OpenPorts[0].HTTPTitle)
+	}
+	if tui.hosts[0].OpenPorts[1].Service != "ssh" {
+		t.Fatalf("unrelated port changed: %+v", tui.hosts[0].OpenPorts[1])
+	}
+	if _, ok := tui.hostChangedAt["10.0.0.5"]; !ok {
+		t.Fatal("expected change highlight recorded for refreshed host")
+	}
+}
+
+func TestHTTPRefreshDropsMissingAndStale(t *testing.T) {
+	tui := &scanTUI{
+		out:           io.Discard,
+		pingStats:     map[string]*hostPingStats{},
+		hostChangedAt: map[string]time.Time{},
+	}
+	tui.hosts = []hostResult{{
+		IP:        "10.0.0.5",
+		OpenPorts: []portResult{{Port: 80, Service: "http", HTTPStatus: "200 OK"}},
+	}}
+
+	// Host not in the table (e.g. cleared by a rescan): no-op, no panic.
+	tui.HTTPRefresh(hostResult{IP: "10.0.0.99", OpenPorts: []portResult{{Port: 80, HTTPStatus: "302 Found"}}})
+	if len(tui.hosts) != 1 || tui.hosts[0].IP != "10.0.0.5" {
+		t.Fatalf("missing-host refresh should not add hosts: %+v", tui.hosts)
+	}
+
+	// Stale probe arriving after the port is already populated must not clobber.
+	tui.HTTPRefresh(hostResult{IP: "10.0.0.5", OpenPorts: []portResult{{Port: 80, HTTPStatus: "500 Error"}}})
+	if tui.hosts[0].OpenPorts[0].HTTPStatus != "200 OK" {
+		t.Fatalf("stale refresh clobbered status=%q", tui.hosts[0].OpenPorts[0].HTTPStatus)
 	}
 }
 

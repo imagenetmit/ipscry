@@ -77,6 +77,7 @@ port,service,vendors
 8080,HTTP proxy / app server,Apache Tomcat; Jenkins; JBoss/WildFly; HTTP proxies
 8081,HTTP (alternate),Apache Tomcat (secondary connector); app server admin
 8082,HTTP (alternate),secondary app servers; dev/test HTTP services
+8092,HTTP (alternate),Cisco Meraki local
 8181,HTTP (alternate),Apache Tomcat admin; GlassFish; alternate admin HTTP
 8443,HTTPS (alternate),Apache Tomcat SSL; UniFi Network Application; admin HTTPS panels
 8888,HTTP (alternate),Jupyter Notebook; HTTP alternate bindings; NAS admin UIs

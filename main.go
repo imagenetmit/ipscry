@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -34,6 +35,16 @@ import (
 const (
 	appName     = "ipscry"
 	maxFieldLen = 240 // max bytes retained for any sanitized free-text field
+
+	// httpProbeTimeoutDefault is the default second-pass timeout for fully
+	// retrieving HTTP/HTTPS page info from servers whose port was already
+	// discovered with the shorter connect timeout. The discovery scan stays
+	// fast; only confirmed web ports get this longer, deeper probe.
+	httpProbeTimeoutDefault = 5 * time.Second
+	// httpProbeConcurrency bounds the second-pass page retrievals. Page fetches
+	// are heavier than connect dials, and the set of web ports is small, so this
+	// is far lower than the port-scan concurrency.
+	httpProbeConcurrency = 16
 )
 
 // appVersion is overridable at build time:
@@ -103,10 +114,12 @@ type scanConfig struct {
 	JSONPath      string
 	CSVPath       string
 	LogPath       string
+	WebhookURL    string
 	MACFormat     string
 	ARPCache      bool
 	AIP           bool
 	TUIARPDetail  bool
+	HTTPTimeout   time.Duration
 }
 
 type scanReport struct {
@@ -138,15 +151,16 @@ type hostResult struct {
 }
 
 type portResult struct {
-	Port       int    `json:"port"`
-	Service    string `json:"service"`
-	Vendors    string `json:"vendors,omitempty"`
-	Banner     string `json:"banner,omitempty"`
-	HTTPStatus string `json:"http_status,omitempty"`
-	HTTPServer string `json:"http_server,omitempty"`
-	HTTPTitle  string `json:"http_title,omitempty"`
-	TLSSubject string `json:"tls_subject,omitempty"`
-	ProbeError string `json:"probe_error,omitempty"`
+	Port         int    `json:"port"`
+	Service      string `json:"service"`
+	Vendors      string `json:"vendors,omitempty"`
+	Banner       string `json:"banner,omitempty"`
+	HTTPStatus   string `json:"http_status,omitempty"`
+	HTTPServer   string `json:"http_server,omitempty"`
+	HTTPTitle    string `json:"http_title,omitempty"`
+	HTTPRedirect string `json:"http_redirect,omitempty"`
+	TLSSubject   string `json:"tls_subject,omitempty"`
+	ProbeError   string `json:"probe_error,omitempty"`
 }
 
 type portScanResult struct {
@@ -236,7 +250,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	if tui != nil {
 		tui.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)), enrich)
 	}
-	hosts := scanNetwork(ctx, ips, cfg.Ports, cfg.Timeout, cfg.Concurrency, enrich, logger, progress, monitor)
+	hosts := scanNetwork(ctx, ips, cfg.Ports, cfg.Timeout, cfg.Concurrency, cfg.HTTPTimeout, enrich, logger, progress, monitor)
 	completed := time.Now().UTC()
 	elapsed := completed.Sub(started)
 	if tui != nil {
@@ -245,6 +259,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 			ports:       cfg.Ports,
 			timeout:     cfg.Timeout,
 			concurrency: cfg.Concurrency,
+			httpTimeout: cfg.HTTPTimeout,
 			enrich:      enrich,
 			logger:      logger,
 			macFormat:   cfg.MACFormat,
@@ -314,10 +329,12 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	jsonPath := fs.String("json", "", "write JSON results to path")
 	csvPath := fs.String("csv", "", "write CSV results to path")
 	logPath := fs.String("log", "", "write audit log to path")
+	webhookURL := fs.String("webhook", "", "POST JSON results to URL")
 	macFormat := fs.String("mac-format", "colon", "MAC format: colon, none, dash")
 	arpCache := fs.Bool("arp-dead", false, "include IPs from the local ARP cache with no open ports")
 	arpDetail := fs.Bool("arp-detail", false, "show ARP State/Alias/Index columns in the TUI")
 	aipView := fs.Bool("aip", false, "display results like Advanced IP Scanner")
+	httpTimeout := fs.Duration("http-timeout", httpProbeTimeoutDefault, "second-pass timeout for HTTP/HTTPS page retrieval")
 
 	normalizedArgs, positional, err := normalizeScanArgs(args)
 	if err != nil {
@@ -338,23 +355,34 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	cfg.JSONPath = strings.TrimSpace(*jsonPath)
 	cfg.CSVPath = strings.TrimSpace(*csvPath)
 	cfg.LogPath = strings.TrimSpace(*logPath)
+	if raw := strings.TrimSpace(*webhookURL); raw != "" {
+		parsed, err := parseWebhookURL(raw)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.WebhookURL = parsed
+	}
 	cfg.MACFormat = strings.ToLower(strings.TrimSpace(*macFormat))
 	cfg.ARPCache = *arpCache
 	cfg.TUIARPDetail = *arpDetail
 	cfg.AIP = *aipView
+	cfg.HTTPTimeout = *httpTimeout
 	if cfg.AIP {
 		cfg.ARPCache = true
 	}
 
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	hasOutputPath := set["json"] || set["csv"] || set["log"]
+	hasOutputPath := set["json"] || set["csv"] || set["log"] || set["webhook"]
 
 	cfg.TUI = !*noTUI && !hasOutputPath
 	cfg.Progress = !cfg.TUI && !hasOutputPath
 
 	if cfg.Timeout <= 0 {
 		return cfg, errors.New("timeout must be greater than zero")
+	}
+	if cfg.HTTPTimeout <= 0 {
+		return cfg, errors.New("http-timeout must be greater than zero")
 	}
 	if cfg.Concurrency < 1 || cfg.Concurrency > 2048 {
 		return cfg, errors.New("concurrency must be between 1 and 2048")
@@ -394,15 +422,18 @@ var scanFlagAliases = map[string]string{
 	"j": "json",
 	"C": "csv",
 	"L": "log",
+	"w": "webhook",
 	"m": "mac-format",
 	"a": "arp-dead",
 	"R": "arp-detail",
 	"s": "snmp-community",
+	"H": "http-timeout",
 }
 
 var scanValueFlags = map[string]bool{
 	"ports": true, "timeout": true, "concurrency": true,
-	"snmp-community": true, "json": true, "csv": true, "log": true, "mac-format": true,
+	"snmp-community": true, "json": true, "csv": true, "log": true, "webhook": true, "mac-format": true,
+	"http-timeout": true,
 }
 
 func normalizeFlagToken(arg string) (string, error) {
@@ -473,10 +504,12 @@ Options:
   -j, --json PATH       write JSON results (optional)
   -C, --csv PATH        write CSV results (optional)
   -L, --log PATH        write audit log (optional)
+  -w, --webhook URL     POST JSON results to HTTP endpoint (optional)
   -m, --mac-format colon|none|dash
   -a, --arp-dead        include offline hosts from the local ARP cache
   -R, --arp-detail      show ARP State/Alias/Index columns in the TUI
       --aip             Advanced IP Scanner-style results table
+  -H, --http-timeout 5s second-pass timeout for HTTP/HTTPS page retrieval
 `, appName, appVersion)
 }
 
@@ -791,7 +824,7 @@ type enrichConfig struct {
 	tuiARPDetail  bool
 }
 
-func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Duration, concurrency int, enrich enrichConfig, logger *log.Logger, progress io.Writer, monitor scanMonitor) []hostResult {
+func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Duration, concurrency int, httpTimeout time.Duration, enrich enrichConfig, logger *log.Logger, progress io.Writer, monitor scanMonitor) []hostResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -922,6 +955,12 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	sort.Slice(hosts, func(i, j int) bool {
 		return lessIP(hosts[i].IP, hosts[j].IP)
 	})
+	// Second pass: fully retrieve HTTP/HTTPS page info from web ports that the
+	// short connect timeout left unprobed. Synchronous when there is no TUI so
+	// console/JSON/CSV/webhook output carries the richer metadata; background
+	// when a TUI monitor is attached so host rows fill in live without delaying
+	// the watch phase.
+	runDeepHTTPProbe(ctx, hosts, httpTimeout, httpProbeConcurrency, monitor, logger)
 	return hosts
 }
 
@@ -1168,6 +1207,16 @@ func probeHTTP(ctx context.Context, ip string, port int, timeout time.Duration, 
 	}
 	defer resp.Body.Close()
 	pr.HTTPStatus = resp.Status
+	if code := resp.StatusCode; code >= 300 && code < 400 {
+		if loc := strings.TrimSpace(resp.Header.Get("Location")); loc != "" {
+			if base := resp.Request.URL; base != nil {
+				if abs, err := base.Parse(loc); err == nil {
+					loc = abs.String()
+				}
+			}
+			pr.HTTPRedirect = sanitizeOneLine(loc)
+		}
+	}
 	pr.HTTPServer = sanitizeOneLine(resp.Header.Get("Server"))
 	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		pr.TLSSubject = sanitizeOneLine(resp.TLS.PeerCertificates[0].Subject.String())
@@ -1175,6 +1224,99 @@ func probeHTTP(ctx context.Context, ip string, port int, timeout time.Duration, 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	pr.HTTPTitle = extractTitle(string(body))
 	return true
+}
+
+// portNeedsHTTPProbe reports whether an open web port still lacks an HTTP
+// response, meaning the short connect-timeout probe timed out before any page
+// info could be collected. These ports get a longer second pass.
+func portNeedsHTTPProbe(pr portResult) bool {
+	info, ok := portCatalog[pr.Port]
+	return ok && info.http && pr.HTTPStatus == ""
+}
+
+// deepProbeHTTPPort re-runs the HTTP(S) page retrieval against an already-open
+// web port using the longer second-pass timeout. Only the per-port HTTP/TLS
+// metadata fields are populated; discovery-only fields (Port/Service/Vendors)
+// are preserved from the original result.
+func deepProbeHTTPPort(ctx context.Context, ip string, pr portResult, timeout time.Duration) portResult {
+	out := portResult{
+		Port:    pr.Port,
+		Service: pr.Service,
+		Vendors: pr.Vendors,
+		Banner:  pr.Banner,
+	}
+	probeHTTP(ctx, ip, pr.Port, timeout, &out)
+	return out
+}
+
+// runDeepHTTPProbe schedules second-pass HTTP/HTTPS page retrievals for every
+// open web port the discovery scan could not fully probe. With a monitor
+// attached (TUI) it runs in the background and streams refreshed ports back via
+// HTTPRefresh; without one it runs synchronously and mutates hosts in place so
+// non-TUI output reflects the fuller metadata.
+func runDeepHTTPProbe(ctx context.Context, hosts []hostResult, timeout time.Duration, concurrency int, monitor scanMonitor, logger *log.Logger) {
+	if timeout <= 0 || ctx.Err() != nil {
+		return
+	}
+	type httpJob struct {
+		hostIdx int
+		portIdx int
+		ip      string
+		port    portResult
+	}
+	var jobs []httpJob
+	for i := range hosts {
+		for j := range hosts[i].OpenPorts {
+			if portNeedsHTTPProbe(hosts[i].OpenPorts[j]) {
+				jobs = append(jobs, httpJob{i, j, hosts[i].IP, hosts[i].OpenPorts[j]})
+			}
+		}
+	}
+	if len(jobs) == 0 {
+		return
+	}
+	if logger != nil {
+		logger.Printf("http deep probe start targets=%d timeout=%s concurrency=%d", len(jobs), timeout, concurrency)
+	}
+
+	work := func() {
+		sem := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+		for _, j := range jobs {
+			if ctx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(j httpJob) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				updated := deepProbeHTTPPort(ctx, j.ip, j.port, timeout)
+				if updated.HTTPStatus == "" {
+					return // second attempt also failed; leave the original port untouched
+				}
+				if monitor != nil {
+					monitor.HTTPRefresh(hostResult{IP: j.ip, OpenPorts: []portResult{updated}})
+					return
+				}
+				if j.hostIdx < len(hosts) && hosts[j.hostIdx].IP == j.ip &&
+					j.portIdx < len(hosts[j.hostIdx].OpenPorts) &&
+					hosts[j.hostIdx].OpenPorts[j.portIdx].Port == j.port.Port {
+					hosts[j.hostIdx].OpenPorts[j.portIdx] = updated
+				}
+			}(j)
+		}
+		wg.Wait()
+		if logger != nil {
+			logger.Printf("http deep probe complete")
+		}
+	}
+
+	if monitor != nil {
+		go work()
+	} else {
+		work()
+	}
 }
 
 // probeTLS performs a single TLS dial: success proves the port is open and lets us
@@ -1756,7 +1898,39 @@ func writeArtifacts(report scanReport, cfg scanConfig) error {
 			return err
 		}
 	}
+	if cfg.WebhookURL != "" {
+		if err := postJSONWebhook(cfg.WebhookURL, report, cfg.MACFormat); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func parseWebhookURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid webhook URL %q: %w", raw, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("webhook URL %q must use http or https", raw)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("webhook URL %q must include a host", raw)
+	}
+	return raw, nil
+}
+
+func encodeJSONReport(w io.Writer, report scanReport, macFormat string) error {
+	out := report
+	out.Hosts = append([]hostResult(nil), report.Hosts...)
+	for i := range out.Hosts {
+		out.Hosts[i].MAC = formatMAC(out.Hosts[i].MAC, macFormat)
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
 }
 
 func writeJSON(path string, report scanReport, macFormat string) error {
@@ -1768,14 +1942,31 @@ func writeJSON(path string, report scanReport, macFormat string) error {
 		return err
 	}
 	defer file.Close()
-	out := report
-	out.Hosts = append([]hostResult(nil), report.Hosts...)
-	for i := range out.Hosts {
-		out.Hosts[i].MAC = formatMAC(out.Hosts[i].MAC, macFormat)
+	return encodeJSONReport(file, report, macFormat)
+}
+
+func postJSONWebhook(webhookURL string, report scanReport, macFormat string) error {
+	var body bytes.Buffer
+	if err := encodeJSONReport(&body, report, macFormat); err != nil {
+		return err
 	}
-	enc := json.NewEncoder(file)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body.Bytes()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", appName+"/"+appVersion)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("webhook POST %s: %w", webhookURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook POST %s returned %s", webhookURL, resp.Status)
+	}
+	return nil
 }
 
 func writeCSV(path string, report scanReport, macFormat string) error {
@@ -1790,7 +1981,7 @@ func writeCSV(path string, report scanReport, macFormat string) error {
 	w := csv.NewWriter(file)
 	defer w.Flush()
 
-	if err := w.Write([]string{"ip", "mac", "mac_vendor", "latency_ms", "hostname", "guess", "status", "arp_type", "arp_ifindex", "port", "service", "vendors", "banner", "http_status", "http_server", "http_title", "tls_subject", "snmp_sysname", "snmp_sysdescr"}); err != nil {
+	if err := w.Write([]string{"ip", "mac", "mac_vendor", "latency_ms", "hostname", "guess", "status", "arp_type", "arp_ifindex", "port", "service", "vendors", "banner", "http_status", "http_server", "http_title", "http_redirect", "tls_subject", "snmp_sysname", "snmp_sysdescr"}); err != nil {
 		return err
 	}
 	for _, host := range report.Hosts {
@@ -1820,7 +2011,7 @@ func hostCSVRow(host hostResult, port portResult, macFormat string) []string {
 		host.IP, formatMAC(host.MAC, macFormat), host.MACVendor, formatLatency(host.LatencyMS),
 		host.Hostname, host.Guess, host.Status, host.ARPType, strconv.FormatUint(uint64(host.ARPIfIndex), 10),
 		portNum, service, port.Vendors,
-		port.Banner, port.HTTPStatus, port.HTTPServer, port.HTTPTitle, port.TLSSubject,
+		port.Banner, port.HTTPStatus, port.HTTPServer, port.HTTPTitle, port.HTTPRedirect, port.TLSSubject,
 		host.SysName, host.SysDescr,
 	}
 }

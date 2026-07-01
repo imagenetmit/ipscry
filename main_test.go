@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -196,13 +197,158 @@ func TestProbeHTTPReturnsMetadata(t *testing.T) {
 	}
 }
 
+func TestProbeHTTPCapturesRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
+	}))
+	defer server.Close()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	pr := portResult{Port: port, Service: "unknown"}
+	if !probeHTTP(context.Background(), "127.0.0.1", port, time.Second, &pr) {
+		t.Fatalf("expected successful HTTP probe: %s", pr.ProbeError)
+	}
+	if pr.HTTPStatus != "302 Found" {
+		t.Fatalf("status=%q, want 302 Found", pr.HTTPStatus)
+	}
+	want := fmt.Sprintf("http://127.0.0.1:%d/admin/login", port)
+	if pr.HTTPRedirect != want {
+		t.Fatalf("redirect=%q, want %q", pr.HTTPRedirect, want)
+	}
+}
+
 func TestParseScanArgsNoOutputPathsByDefault(t *testing.T) {
 	cfg, err := parseScanArgs([]string{"192.168.1.0/24"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.JSONPath != "" || cfg.CSVPath != "" || cfg.LogPath != "" {
-		t.Fatalf("json=%q csv=%q log=%q, want all empty", cfg.JSONPath, cfg.CSVPath, cfg.LogPath)
+	if cfg.JSONPath != "" || cfg.CSVPath != "" || cfg.LogPath != "" || cfg.WebhookURL != "" {
+		t.Fatalf("json=%q csv=%q log=%q webhook=%q, want all empty", cfg.JSONPath, cfg.CSVPath, cfg.LogPath, cfg.WebhookURL)
+	}
+}
+
+func TestParseScanArgsHTTPTimeoutDefaultAndAlias(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPTimeout != httpProbeTimeoutDefault {
+		t.Fatalf("http-timeout=%s, want default %s", cfg.HTTPTimeout, httpProbeTimeoutDefault)
+	}
+
+	cfg, err = parseScanArgs([]string{"192.168.1.0/24", "-H", "12s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPTimeout != 12*time.Second {
+		t.Fatalf("http-timeout=%s, want 12s", cfg.HTTPTimeout)
+	}
+
+	if _, err := parseScanArgs([]string{"192.168.1.0/24", "-H", "0s"}); err == nil {
+		t.Fatal("expected error for zero http-timeout")
+	}
+}
+
+func TestPortNeedsHTTPProbe(t *testing.T) {
+	cases := []struct {
+		name string
+		pr   portResult
+		want bool
+	}{
+		{"http port no response", portResult{Port: 80, Service: "http"}, true},
+		{"https port no response", portResult{Port: 443, Service: "https"}, true},
+		{"http port already probed", portResult{Port: 80, HTTPStatus: "200 OK"}, false},
+		{"non-web port", portResult{Port: 22, Service: "ssh"}, false},
+		{"unknown port", portResult{Port: 54321}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := portNeedsHTTPProbe(c.pr); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestDeepProbeHTTPPort(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(120 * time.Millisecond)
+		w.Header().Set("Server", "ipscry-slow")
+		_, _ = w.Write([]byte("<html><head><title>Slow Device</title></head></html>"))
+	}))
+	defer server.Close()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	orig := portResult{Port: port, Service: "http-alt", Vendors: "Alt"}
+
+	// A short timeout cannot reach the 120ms-slow handler, so the deep probe
+	// yields no HTTP response.
+	short := deepProbeHTTPPort(context.Background(), "127.0.0.1", orig, 10*time.Millisecond)
+	if short.HTTPStatus != "" {
+		t.Fatalf("short probe status=%q, want empty", short.HTTPStatus)
+	}
+	if short.Service != "http-alt" || short.Vendors != "Alt" {
+		t.Fatalf("deep probe dropped discovery fields: service=%q vendors=%q", short.Service, short.Vendors)
+	}
+
+	// A longer timeout fully retrieves the page info.
+	long := deepProbeHTTPPort(context.Background(), "127.0.0.1", orig, 2*time.Second)
+	if long.HTTPStatus != "200 OK" {
+		t.Fatalf("long probe status=%q, want 200 OK (%s)", long.HTTPStatus, long.ProbeError)
+	}
+	if long.HTTPTitle != "Slow Device" {
+		t.Fatalf("long probe title=%q, want Slow Device", long.HTTPTitle)
+	}
+	if long.HTTPServer != "ipscry-slow" {
+		t.Fatalf("long probe server=%q, want ipscry-slow", long.HTTPServer)
+	}
+}
+
+// TestRunDeepHTTPProbeSyncUpdatesHosts exercises the synchronous (no-monitor)
+// path: a web port discovered with a too-short timeout is left without HTTP
+// metadata, and the second pass fills it in place so non-TUI output carries the
+// richer page info.
+func TestRunDeepHTTPProbeSyncUpdatesHosts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(120 * time.Millisecond)
+		_, _ = w.Write([]byte("<html><head><title>Sync Fill</title></head></html>"))
+	}))
+	defer server.Close()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	// Register the random listener port as a web port so portNeedsHTTPProbe
+	// recognizes it, restoring the catalog after the test.
+	prev, hadPrev := portCatalog[port]
+	portCatalog[port] = portInfo{service: "test-http", http: true}
+	defer func() {
+		if hadPrev {
+			portCatalog[port] = prev
+		} else {
+			delete(portCatalog, port)
+		}
+	}()
+
+	// Discover the port with a timeout shorter than the handler's 120ms reply.
+	res, ok := scanPort(context.Background(), "127.0.0.1", port, 10*time.Millisecond)
+	if !ok {
+		t.Fatal("expected port discovered open via TCP fallback")
+	}
+	if res.port.HTTPStatus != "" {
+		t.Fatalf("discovery should have no HTTP status, got %q", res.port.HTTPStatus)
+	}
+
+	hosts := []hostResult{{IP: "127.0.0.1", OpenPorts: []portResult{res.port}}}
+	runDeepHTTPProbe(context.Background(), hosts, 2*time.Second, httpProbeConcurrency, nil, nil)
+
+	if len(hosts[0].OpenPorts) != 1 {
+		t.Fatalf("open ports=%d, want 1", len(hosts[0].OpenPorts))
+	}
+	got := hosts[0].OpenPorts[0]
+	if got.HTTPStatus != "200 OK" {
+		t.Fatalf("after deep probe status=%q, want 200 OK (%s)", got.HTTPStatus, got.ProbeError)
+	}
+	if got.HTTPTitle != "Sync Fill" {
+		t.Fatalf("after deep probe title=%q, want Sync Fill", got.HTTPTitle)
 	}
 }
 
@@ -306,6 +452,101 @@ func TestWriteArtifacts(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestParseScanArgsWebhook(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "-w", "https://hooks.example/scan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebhookURL != "https://hooks.example/scan" {
+		t.Fatalf("webhook=%q", cfg.WebhookURL)
+	}
+	if cfg.TUI {
+		t.Fatal("expected TUI off when webhook set")
+	}
+}
+
+func TestParseWebhookURL(t *testing.T) {
+	cases := []struct {
+		raw   string
+		valid bool
+	}{
+		{"https://hooks.example/scan", true},
+		{"http://127.0.0.1:8080/hook", true},
+		{"ftp://hooks.example/scan", false},
+		{"not-a-url", false},
+		{"http:///missing-host", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			got, err := parseWebhookURL(tc.raw)
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != tc.raw {
+					t.Fatalf("got %q", got)
+				}
+			} else if err == nil {
+				t.Fatalf("expected error for %q, got %q", tc.raw, got)
+			}
+		})
+	}
+}
+
+func TestPostJSONWebhook(t *testing.T) {
+	report := scanReport{
+		Scanner:     appName,
+		Version:     appVersion,
+		StartedAt:   time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		CompletedAt: time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC),
+		Target:      "192.168.1.0/24",
+		Hosts: []hostResult{{
+			IP: "192.168.1.5", MAC: "aa:bb:cc:dd:ee:ff", MACVendor: "Acme, Inc", Guess: "windows",
+			OpenPorts: []portResult{{Port: 445, Service: "smb"}},
+		}},
+	}
+	var gotMethod, gotContentType, gotUserAgent string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotContentType = r.Header.Get("Content-Type")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	if err := postJSONWebhook(server.URL, report, "dash"); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("method=%q, want POST", gotMethod)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("content-type=%q", gotContentType)
+	}
+	if gotUserAgent != appName+"/"+appVersion {
+		t.Fatalf("user-agent=%q", gotUserAgent)
+	}
+	if !strings.Contains(string(gotBody), `"mac": "aa-bb-cc-dd-ee-ff"`) {
+		t.Fatalf("body missing formatted mac:\n%s", gotBody)
+	}
+	if !strings.Contains(string(gotBody), `"target": "192.168.1.0/24"`) {
+		t.Fatalf("body missing target:\n%s", gotBody)
+	}
+}
+
+func TestPostJSONWebhookRejectsNon2xx(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	err := postJSONWebhook(server.URL, scanReport{Target: "127.0.0.1/32"}, "colon")
+	if err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("err=%v, want 500 response error", err)
 	}
 }
 
@@ -437,6 +678,7 @@ func TestProgressDefaulting(t *testing.T) {
 		{"on with --no-tui", []string{"192.168.1.0/24", "--no-tui"}, true},
 		{"off when json set", []string{"192.168.1.0/24", "--json", "out.json"}, false},
 		{"off when log set", []string{"192.168.1.0/24", "--log", "out.log"}, false},
+		{"off when webhook set", []string{"192.168.1.0/24", "--webhook", "https://example.com/hook"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
