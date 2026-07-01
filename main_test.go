@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -468,6 +469,19 @@ func TestParseScanArgsWebhook(t *testing.T) {
 	}
 }
 
+func TestParseScanArgsProgressWebhook(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "-P", "https://hooks.example/progress"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProgressURL != "https://hooks.example/progress" {
+		t.Fatalf("progress webhook=%q", cfg.ProgressURL)
+	}
+	if cfg.TUI {
+		t.Fatal("expected TUI off when progress webhook set")
+	}
+}
+
 func TestParseWebhookURL(t *testing.T) {
 	cases := []struct {
 		raw   string
@@ -547,6 +561,46 @@ func TestPostJSONWebhookRejectsNon2xx(t *testing.T) {
 	err := postJSONWebhook(server.URL, scanReport{Target: "127.0.0.1/32"}, "colon")
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("err=%v, want 500 response error", err)
+	}
+}
+
+func TestPostProgressWebhook(t *testing.T) {
+	var gotMethod, gotContentType, gotUserAgent string
+	var got scanProgressEvent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotContentType = r.Header.Get("Content-Type")
+		gotUserAgent = r.Header.Get("User-Agent")
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	err := postProgressWebhook(server.URL, scanProgressEvent{
+		Event:        "scan_progress",
+		Phase:        "scanning",
+		Message:      "Scanned 50/100 port checks",
+		Target:       "192.168.1.0/24",
+		ScannedPorts: 50,
+		TotalPorts:   100,
+		Percent:      50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("method=%q, want POST", gotMethod)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("content-type=%q", gotContentType)
+	}
+	if gotUserAgent != appName+"/"+appVersion {
+		t.Fatalf("user-agent=%q", gotUserAgent)
+	}
+	if got.Event != "scan_progress" || got.Percent != 50 || got.Target != "192.168.1.0/24" {
+		t.Fatalf("unexpected event: %+v", got)
 	}
 }
 

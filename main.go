@@ -115,6 +115,7 @@ type scanConfig struct {
 	CSVPath       string
 	LogPath       string
 	WebhookURL    string
+	ProgressURL   string
 	MACFormat     string
 	ARPCache      bool
 	AIP           bool
@@ -132,6 +133,25 @@ type scanReport struct {
 	Concurrency int          `json:"concurrency"`
 	Ports       []int        `json:"ports"`
 	Hosts       []hostResult `json:"hosts"`
+}
+
+type scanProgressEvent struct {
+	Scanner      string    `json:"scanner"`
+	Version      string    `json:"version"`
+	Event        string    `json:"event"`
+	Phase        string    `json:"phase"`
+	Message      string    `json:"message"`
+	Target       string    `json:"target"`
+	Timestamp    time.Time `json:"timestamp"`
+	ScannedPorts int64     `json:"scanned_ports,omitempty"`
+	TotalPorts   int64     `json:"total_ports,omitempty"`
+	Percent      int       `json:"percent,omitempty"`
+	OpenHosts    int       `json:"open_hosts,omitempty"`
+	ReadyHosts   int       `json:"ready_hosts,omitempty"`
+	TotalHosts   int       `json:"total_hosts,omitempty"`
+	IP           string    `json:"ip,omitempty"`
+	PortCount    int       `json:"port_count,omitempty"`
+	ElapsedMS    int64     `json:"elapsed_ms,omitempty"`
 }
 
 type hostResult struct {
@@ -228,6 +248,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	var progress io.Writer
 	var monitor scanMonitor
 	var tui *scanTUI
+	var progressMonitor *webhookProgressMonitor
 	if cfg.TUI {
 		tui, err = newScanTUI(stdout)
 		if err != nil {
@@ -236,6 +257,14 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		} else {
 			defer tui.Close()
 			monitor = tui
+		}
+	}
+	if cfg.ProgressURL != "" {
+		progressMonitor = newWebhookProgressMonitor(cfg.ProgressURL, cfg.Target, logger)
+		if monitor == nil {
+			monitor = progressMonitor
+		} else {
+			monitor = multiScanMonitor{monitor, progressMonitor}
 		}
 	}
 	if !cfg.TUI && cfg.Progress {
@@ -247,8 +276,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		targetCIDR:    cfg.Target,
 		tuiARPDetail:  cfg.TUIARPDetail,
 	}
-	if tui != nil {
-		tui.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)), enrich)
+	if monitor != nil {
+		monitor.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)), enrich)
 	}
 	hosts := scanNetwork(ctx, ips, cfg.Ports, cfg.Timeout, cfg.Concurrency, cfg.HTTPTimeout, enrich, logger, progress, monitor)
 	completed := time.Now().UTC()
@@ -265,6 +294,9 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 			macFormat:   cfg.MACFormat,
 			started:     started,
 		})
+	}
+	if progressMonitor != nil {
+		progressMonitor.Finish(hosts, elapsed, ctx, tuiWatchConfig{})
 	}
 
 	for _, host := range hosts {
@@ -330,6 +362,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	csvPath := fs.String("csv", "", "write CSV results to path")
 	logPath := fs.String("log", "", "write audit log to path")
 	webhookURL := fs.String("webhook", "", "POST JSON results to URL")
+	progressURL := fs.String("progress-webhook", "", "POST JSON progress events to URL")
 	macFormat := fs.String("mac-format", "colon", "MAC format: colon, none, dash")
 	arpCache := fs.Bool("arp-dead", false, "include IPs from the local ARP cache with no open ports")
 	arpDetail := fs.Bool("arp-detail", false, "show ARP State/Alias/Index columns in the TUI")
@@ -362,6 +395,13 @@ func parseScanArgs(args []string) (scanConfig, error) {
 		}
 		cfg.WebhookURL = parsed
 	}
+	if raw := strings.TrimSpace(*progressURL); raw != "" {
+		parsed, err := parseWebhookURL(raw)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.ProgressURL = parsed
+	}
 	cfg.MACFormat = strings.ToLower(strings.TrimSpace(*macFormat))
 	cfg.ARPCache = *arpCache
 	cfg.TUIARPDetail = *arpDetail
@@ -373,7 +413,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	hasOutputPath := set["json"] || set["csv"] || set["log"] || set["webhook"]
+	hasOutputPath := set["json"] || set["csv"] || set["log"] || set["webhook"] || set["progress-webhook"]
 
 	cfg.TUI = !*noTUI && !hasOutputPath
 	cfg.Progress = !cfg.TUI && !hasOutputPath
@@ -423,6 +463,7 @@ var scanFlagAliases = map[string]string{
 	"C": "csv",
 	"L": "log",
 	"w": "webhook",
+	"P": "progress-webhook",
 	"m": "mac-format",
 	"a": "arp-dead",
 	"R": "arp-detail",
@@ -432,7 +473,7 @@ var scanFlagAliases = map[string]string{
 
 var scanValueFlags = map[string]bool{
 	"ports": true, "timeout": true, "concurrency": true,
-	"snmp-community": true, "json": true, "csv": true, "log": true, "webhook": true, "mac-format": true,
+	"snmp-community": true, "json": true, "csv": true, "log": true, "webhook": true, "progress-webhook": true, "mac-format": true,
 	"http-timeout": true,
 }
 
@@ -505,6 +546,8 @@ Options:
   -C, --csv PATH        write CSV results (optional)
   -L, --log PATH        write audit log (optional)
   -w, --webhook URL     POST JSON results to HTTP endpoint (optional)
+  -P, --progress-webhook URL
+                         POST JSON progress events to HTTP endpoint (optional)
   -m, --mac-format colon|none|dash
   -a, --arp-dead        include offline hosts from the local ARP cache
   -R, --arp-detail      show ARP State/Alias/Index columns in the TUI
@@ -1920,6 +1963,232 @@ func parseWebhookURL(raw string) (string, error) {
 		return "", fmt.Errorf("webhook URL %q must include a host", raw)
 	}
 	return raw, nil
+}
+
+type multiScanMonitor []scanMonitor
+
+func (m multiScanMonitor) Start(target string, totalPorts int64, enrich enrichConfig) {
+	for _, monitor := range m {
+		monitor.Start(target, totalPorts, enrich)
+	}
+}
+
+func (m multiScanMonitor) PortProgress(scanned, total int64) {
+	for _, monitor := range m {
+		monitor.PortProgress(scanned, total)
+	}
+}
+
+func (m multiScanMonitor) PortOpen(ip string, latencyMS int64) {
+	for _, monitor := range m {
+		monitor.PortOpen(ip, latencyMS)
+	}
+}
+
+func (m multiScanMonitor) EnrichStart(ips []string, enrich enrichConfig) {
+	for _, monitor := range m {
+		monitor.EnrichStart(ips, enrich)
+	}
+}
+
+func (m multiScanMonitor) HostReady(host hostResult) {
+	for _, monitor := range m {
+		monitor.HostReady(host)
+	}
+}
+
+func (m multiScanMonitor) HTTPRefresh(updated hostResult) {
+	for _, monitor := range m {
+		monitor.HTTPRefresh(updated)
+	}
+}
+
+func (m multiScanMonitor) Finish(hosts []hostResult, elapsed time.Duration, ctx context.Context, watch tuiWatchConfig) {
+	for _, monitor := range m {
+		monitor.Finish(hosts, elapsed, ctx, watch)
+	}
+}
+
+func (m multiScanMonitor) Close() {
+	for _, monitor := range m {
+		monitor.Close()
+	}
+}
+
+type webhookProgressMonitor struct {
+	url        string
+	target     string
+	logger     *log.Logger
+	mu         sync.Mutex
+	lastPost   time.Time
+	openHosts  map[string]struct{}
+	readyHosts int
+	totalHosts int
+}
+
+func newWebhookProgressMonitor(webhookURL, target string, logger *log.Logger) *webhookProgressMonitor {
+	return &webhookProgressMonitor{
+		url:       webhookURL,
+		target:    target,
+		logger:    logger,
+		openHosts: map[string]struct{}{},
+	}
+}
+
+func (m *webhookProgressMonitor) Start(target string, totalPorts int64, enrich enrichConfig) {
+	m.post(scanProgressEvent{
+		Event:      "scan_started",
+		Phase:      "scanning",
+		Message:    fmt.Sprintf("ipscry started scanning %s", target),
+		Target:     target,
+		TotalPorts: totalPorts,
+	})
+}
+
+func (m *webhookProgressMonitor) PortProgress(scanned, total int64) {
+	m.mu.Lock()
+	now := time.Now()
+	if scanned < total && now.Sub(m.lastPost) < 5*time.Second {
+		m.mu.Unlock()
+		return
+	}
+	m.lastPost = now
+	openHosts := len(m.openHosts)
+	m.mu.Unlock()
+
+	m.post(scanProgressEvent{
+		Event:        "scan_progress",
+		Phase:        "scanning",
+		Message:      fmt.Sprintf("Scanned %d/%d port checks; found %d responsive host(s)", scanned, total, openHosts),
+		Target:       m.target,
+		ScannedPorts: scanned,
+		TotalPorts:   total,
+		Percent:      progressPercent(scanned, total),
+		OpenHosts:    openHosts,
+	})
+}
+
+func (m *webhookProgressMonitor) PortOpen(ip string, latencyMS int64) {
+	m.mu.Lock()
+	if _, exists := m.openHosts[ip]; exists {
+		m.mu.Unlock()
+		return
+	}
+	m.openHosts[ip] = struct{}{}
+	openHosts := len(m.openHosts)
+	m.mu.Unlock()
+
+	m.post(scanProgressEvent{
+		Event:     "host_discovered",
+		Phase:     "scanning",
+		Message:   fmt.Sprintf("Found responsive host %s", ip),
+		Target:    m.target,
+		IP:        ip,
+		OpenHosts: openHosts,
+	})
+}
+
+func (m *webhookProgressMonitor) EnrichStart(ips []string, enrich enrichConfig) {
+	m.mu.Lock()
+	m.totalHosts = len(ips)
+	m.readyHosts = 0
+	m.mu.Unlock()
+
+	m.post(scanProgressEvent{
+		Event:      "enrichment_started",
+		Phase:      "enriching",
+		Message:    fmt.Sprintf("Enriching %d discovered host(s)", len(ips)),
+		Target:     m.target,
+		TotalHosts: len(ips),
+	})
+}
+
+func (m *webhookProgressMonitor) HostReady(host hostResult) {
+	m.mu.Lock()
+	m.readyHosts++
+	readyHosts := m.readyHosts
+	totalHosts := m.totalHosts
+	shouldPost := readyHosts == totalHosts || readyHosts == 1 || readyHosts%5 == 0
+	m.mu.Unlock()
+	if !shouldPost {
+		return
+	}
+
+	m.post(scanProgressEvent{
+		Event:      "enrichment_progress",
+		Phase:      "enriching",
+		Message:    fmt.Sprintf("Enriched %d/%d host(s)", readyHosts, totalHosts),
+		Target:     m.target,
+		IP:         host.IP,
+		ReadyHosts: readyHosts,
+		TotalHosts: totalHosts,
+	})
+}
+
+func (m *webhookProgressMonitor) HTTPRefresh(updated hostResult) {
+	m.post(scanProgressEvent{
+		Event:     "http_probe_complete",
+		Phase:     "http_probe",
+		Message:   fmt.Sprintf("Collected HTTP details for %s", updated.IP),
+		Target:    m.target,
+		IP:        updated.IP,
+		PortCount: len(updated.OpenPorts),
+	})
+}
+
+func (m *webhookProgressMonitor) Finish(hosts []hostResult, elapsed time.Duration, ctx context.Context, watch tuiWatchConfig) {
+	event := "scan_completed"
+	message := fmt.Sprintf("ipscry completed; found %d host(s)", len(hosts))
+	if ctx != nil && ctx.Err() != nil {
+		event = "scan_cancelled"
+		message = fmt.Sprintf("ipscry cancelled after finding %d host(s)", len(hosts))
+	}
+	m.post(scanProgressEvent{
+		Event:     event,
+		Phase:     "done",
+		Message:   message,
+		Target:    m.target,
+		OpenHosts: len(hosts),
+		ElapsedMS: elapsed.Milliseconds(),
+	})
+}
+
+func (m *webhookProgressMonitor) Close() {}
+
+func (m *webhookProgressMonitor) post(event scanProgressEvent) {
+	event.Scanner = appName
+	event.Version = appVersion
+	if event.Target == "" {
+		event.Target = m.target
+	}
+	event.Timestamp = time.Now().UTC()
+	if err := postProgressWebhook(m.url, event); err != nil && m.logger != nil {
+		m.logger.Printf("progress webhook error event=%s: %v", event.Event, err)
+	}
+}
+
+func postProgressWebhook(webhookURL string, event scanProgressEvent) error {
+	body, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", appName+"/"+appVersion)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("progress webhook POST %s: %w", webhookURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("progress webhook POST %s returned %s", webhookURL, resp.Status)
+	}
+	return nil
 }
 
 func encodeJSONReport(w io.Writer, report scanReport, macFormat string) error {
