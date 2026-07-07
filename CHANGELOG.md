@@ -8,8 +8,14 @@ for tagged releases.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-07
+
 ### Changed
 
+- Reworked project documentation for public release: the README now focuses on
+  downloading and running Ipscry, with build and contribution notes moved to
+  `DEVELOPMENT.md`.
+- Removed checked-in local/private artifacts from the public source tree.
 - TUI mode rejects targets larger than `/22` and prompts for confirmation on `/23`
   and `/22` scans because large result sets overwhelm the terminal UI.
 - Removed redundant CLI flags `--local`, `--progress`, and `--tui`; local /24 is
@@ -26,7 +32,7 @@ for tagged releases.
 
 ### Added
 
-- Professional project documentation and GitHub community health files.
+- Project documentation and GitHub community health files.
 - Windows-oriented local network inventory scanner.
 - Connect-only TCP port scanning with configurable timeout, concurrency, and
   named port profiles.
@@ -38,8 +44,8 @@ for tagged releases.
 - Optional local-subnet MAC vendor lookup with deduplicated, rate-limited API
   calls.
 - JSON, CSV, and UTC audit log artifacts.
-- Windows build, version metadata, RMM deployment guidance, and Authenticode
-  signing helper scripts.
+- Windows build, version metadata, and Authenticode signing helper scripts.
 
-[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/imagenetmit/ipscry/releases/tag/v0.1.0

@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   release:
+    environment:
+      name: release-signing
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
