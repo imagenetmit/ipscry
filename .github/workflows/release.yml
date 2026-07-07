@@ -13,7 +13,7 @@ permissions:
 jobs:
   release:
     environment:
-      name: release-signing
+      name: ${{ vars.RELEASE_SIGNING_ENVIRONMENT }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
