@@ -792,8 +792,8 @@ func TestWriteCSVContent(t *testing.T) {
 	}
 	content := string(data)
 	for _, want := range []string{
-		"ip,mac,mac_vendor,latency_ms,hostname,guess,status,arp_type,arp_ifindex,port,service",
-		"192.168.1.5,,,0,printer.local,printer,,,0,9100,jetdirect",
+		"discovery_sources,mdns_name,mdns_services,llmnr_name,ssdp_server",
+		"192.168.1.5,,,0,printer.local,printer,,,0,,,,,,,,,,,9100,jetdirect",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("csv missing %q; got:\n%s", want, content)
@@ -1288,14 +1288,18 @@ func TestWatchPingTimeout(t *testing.T) {
 
 func TestShouldIncludeHost(t *testing.T) {
 	arp := map[string]arpCacheEntry{"192.168.1.5": {MAC: "aa:bb:cc:dd:ee:ff"}}
-	if !shouldIncludeHost([]portResult{{Port: 80}}, enrichConfig{}, arp, "192.168.1.1") {
+	if !shouldIncludeHost([]portResult{{Port: 80}}, enrichConfig{}, arp, "192.168.1.1", nil) {
 		t.Fatal("open port should include host")
 	}
-	if shouldIncludeHost(nil, enrichConfig{}, arp, "192.168.1.1") {
+	if shouldIncludeHost(nil, enrichConfig{}, arp, "192.168.1.1", nil) {
 		t.Fatal("empty ports without arp-dead should exclude")
 	}
-	if !shouldIncludeHost(nil, enrichConfig{arpCache: true}, arp, "192.168.1.5") {
+	if !shouldIncludeHost(nil, enrichConfig{arpCache: true}, arp, "192.168.1.5", nil) {
 		t.Fatal("arp-dead host should include")
+	}
+	discovery := map[string]discoveryHit{"192.168.1.7": {IP: "192.168.1.7", Sources: []string{"mdns"}}}
+	if !shouldIncludeHost(nil, enrichConfig{discovery: discoveryConfig{enabled: true}}, arp, "192.168.1.7", discovery) {
+		t.Fatal("discovery-only host should include")
 	}
 }
 
