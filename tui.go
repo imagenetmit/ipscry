@@ -570,7 +570,7 @@ func (t *scanTUI) discoverHostAsync(ctx context.Context, watch tuiWatchConfig, i
 		t.discoverSem <- struct{}{}
 		defer func() { <-t.discoverSem }()
 		openPorts := scanIPPorts(ctx, ip, watch.ports, watch.timeout, watch.concurrency)
-		if !shouldIncludeHost(openPorts, watch.enrich, arpByIP, ip) {
+		if !shouldIncludeHost(openPorts, watch.enrich, arpByIP, ip, nil) {
 			t.removeHost(ip)
 			return
 		}
@@ -579,7 +579,7 @@ func (t *scanTUI) discoverHostAsync(ctx context.Context, watch tuiWatchConfig, i
 			liveIPs[ip] = struct{}{}
 		}
 		arpDeadByIP := buildARPDeadByIP(arpByIP, liveIPs)
-		host := enrichHost(ctx, ip, openPorts, watch.enrich, watch.timeout, arpByIP, arpDeadByIP, latencyMS)
+		host := enrichHost(ctx, ip, openPorts, watch.enrich, watch.timeout, arpByIP, arpDeadByIP, nil, latencyMS)
 		if watch.logger != nil {
 			watch.logger.Printf("watch discovered ip=%s ports=%d latency_ms=%d guess=%s",
 				host.IP, len(host.OpenPorts), host.LatencyMS, host.Guess)

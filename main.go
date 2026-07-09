@@ -50,7 +50,7 @@ const (
 // appVersion is overridable at build time:
 //
 //	go build -ldflags "-X main.appVersion=1.2.3"
-var appVersion = "0.1.1"
+var appVersion = "0.2.0"
 
 // portInfo is the single source of truth for a known port: its service label and
 // which application-layer probes apply. Adding a port is a one-line edit here.
@@ -104,23 +104,25 @@ var portCatalog = map[int]portInfo{
 }
 
 type scanConfig struct {
-	Target        string
-	Ports         []int
-	Timeout       time.Duration
-	Concurrency   int
-	Progress      bool
-	TUI           bool
-	SNMPCommunity string
-	JSONPath      string
-	CSVPath       string
-	LogPath       string
-	WebhookURL    string
-	ProgressURL   string
-	MACFormat     string
-	ARPCache      bool
-	AIP           bool
-	TUIARPDetail  bool
-	HTTPTimeout   time.Duration
+	Target           string
+	Ports            []int
+	Timeout          time.Duration
+	Concurrency      int
+	Progress         bool
+	TUI              bool
+	SNMPCommunity    string
+	JSONPath         string
+	CSVPath          string
+	LogPath          string
+	WebhookURL       string
+	ProgressURL      string
+	MACFormat        string
+	ARPCache         bool
+	AIP              bool
+	TUIARPDetail     bool
+	HTTPTimeout      time.Duration
+	Discovery        discoveryConfig
+	DiscoveryTimeout time.Duration
 }
 
 type scanReport struct {
@@ -155,19 +157,31 @@ type scanProgressEvent struct {
 }
 
 type hostResult struct {
-	IP         string       `json:"ip"`
-	MAC        string       `json:"mac,omitempty"`
-	MACVendor  string       `json:"mac_vendor,omitempty"`
-	LatencyMS  int64        `json:"latency_ms"`
-	ARPType    string       `json:"arp_type,omitempty"`
-	ARPIfIndex uint32       `json:"arp_ifindex,omitempty"`
-	ARPIfAlias string       `json:"arp_ifalias,omitempty"`
-	Hostname   string       `json:"hostname,omitempty"`
-	SysName    string       `json:"snmp_sysname,omitempty"`
-	SysDescr   string       `json:"snmp_sysdescr,omitempty"`
-	OpenPorts  []portResult `json:"open_ports"`
-	Guess      string       `json:"guess"`
-	Status     string       `json:"status,omitempty"`
+	IP               string       `json:"ip"`
+	MAC              string       `json:"mac,omitempty"`
+	MACVendor        string       `json:"mac_vendor,omitempty"`
+	LatencyMS        int64        `json:"latency_ms"`
+	ARPType          string       `json:"arp_type,omitempty"`
+	ARPIfIndex       uint32       `json:"arp_ifindex,omitempty"`
+	ARPIfAlias       string       `json:"arp_ifalias,omitempty"`
+	Hostname         string       `json:"hostname,omitempty"`
+	SysName          string       `json:"snmp_sysname,omitempty"`
+	SysDescr         string       `json:"snmp_sysdescr,omitempty"`
+	DiscoverySources []string     `json:"discovery_sources,omitempty"`
+	MDNSName         string       `json:"mdns_name,omitempty"`
+	MDNSServices     []string     `json:"mdns_services,omitempty"`
+	LLMNRName        string       `json:"llmnr_name,omitempty"`
+	SSDPServer       string       `json:"ssdp_server,omitempty"`
+	UPnPType         string       `json:"upnp_type,omitempty"`
+	UPnPLocation     string       `json:"upnp_location,omitempty"`
+	UPnPFriendly     string       `json:"upnp_friendly,omitempty"`
+	UPnPModel        string       `json:"upnp_model,omitempty"`
+	WSDTypes         []string     `json:"wsd_types,omitempty"`
+	WSDXAddrs        []string     `json:"wsd_xaddrs,omitempty"`
+	WSDScopes        []string     `json:"wsd_scopes,omitempty"`
+	OpenPorts        []portResult `json:"open_ports"`
+	Guess            string       `json:"guess"`
+	Status           string       `json:"status,omitempty"`
 }
 
 type portResult struct {
@@ -270,11 +284,14 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	if !cfg.TUI && cfg.Progress {
 		progress = stderr
 	}
+	discovery := cfg.Discovery
+	discovery.timeout = cfg.DiscoveryTimeout
 	enrich := enrichConfig{
 		snmpCommunity: cfg.SNMPCommunity,
 		arpCache:      cfg.ARPCache,
 		targetCIDR:    cfg.Target,
 		tuiARPDetail:  cfg.TUIARPDetail,
+		discovery:     discovery,
 	}
 	if monitor != nil {
 		monitor.Start(cfg.Target, int64(len(ips)*len(cfg.Ports)), enrich)
@@ -368,6 +385,8 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	arpDetail := fs.Bool("arp-detail", false, "show ARP State/Alias/Index columns in the TUI")
 	aipView := fs.Bool("aip", false, "display results like Advanced IP Scanner")
 	httpTimeout := fs.Duration("http-timeout", httpProbeTimeoutDefault, "second-pass timeout for HTTP/HTTPS page retrieval")
+	discoveryFlag := fs.String("discovery", "none", "LAN discovery protocols: none, all, ssdp, mdns, llmnr, wsd, or comma-separated")
+	discoveryTimeout := fs.Duration("discovery-timeout", defaultDiscoveryTimeout, "multicast discovery listen/probe window")
 
 	normalizedArgs, positional, err := normalizeScanArgs(args)
 	if err != nil {
@@ -407,6 +426,12 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	cfg.TUIARPDetail = *arpDetail
 	cfg.AIP = *aipView
 	cfg.HTTPTimeout = *httpTimeout
+	discovery, err := parseDiscoveryInput(*discoveryFlag)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Discovery = discovery
+	cfg.DiscoveryTimeout = *discoveryTimeout
 	if cfg.AIP {
 		cfg.ARPCache = true
 	}
@@ -423,6 +448,9 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	}
 	if cfg.HTTPTimeout <= 0 {
 		return cfg, errors.New("http-timeout must be greater than zero")
+	}
+	if cfg.DiscoveryTimeout <= 0 {
+		return cfg, errors.New("discovery-timeout must be greater than zero")
 	}
 	if cfg.Concurrency < 1 || cfg.Concurrency > 2048 {
 		return cfg, errors.New("concurrency must be between 1 and 2048")
@@ -469,12 +497,14 @@ var scanFlagAliases = map[string]string{
 	"R": "arp-detail",
 	"s": "snmp-community",
 	"H": "http-timeout",
+	"d": "discovery",
+	"D": "discovery-timeout",
 }
 
 var scanValueFlags = map[string]bool{
 	"ports": true, "timeout": true, "concurrency": true,
 	"snmp-community": true, "json": true, "csv": true, "log": true, "webhook": true, "progress-webhook": true, "mac-format": true,
-	"http-timeout": true,
+	"http-timeout": true, "discovery": true, "discovery-timeout": true,
 }
 
 func normalizeFlagToken(arg string) (string, error) {
@@ -553,6 +583,10 @@ Options:
   -R, --arp-detail      show ARP State/Alias/Index columns in the TUI
       --aip             Advanced IP Scanner-style results table
   -H, --http-timeout 5s second-pass timeout for HTTP/HTTPS page retrieval
+  -d, --discovery none|all|ssdp,mdns,llmnr,wsd
+                         opt-in LAN discovery via multicast protocols
+  -D, --discovery-timeout 3s
+                         multicast discovery listen/probe window
 `, appName, appVersion)
 }
 
@@ -865,6 +899,7 @@ type enrichConfig struct {
 	arpCache      bool
 	targetCIDR    string
 	tuiARPDetail  bool
+	discovery     discoveryConfig
 }
 
 func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Duration, concurrency int, httpTimeout time.Duration, enrich enrichConfig, logger *log.Logger, progress io.Writer, monitor scanMonitor) []hostResult {
@@ -930,6 +965,16 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	}
 
 	byIP := map[string][]portResult{}
+	var discoveryHits map[string]discoveryHit
+	var discoveryWg sync.WaitGroup
+	if enrich.discovery.enabled {
+		discoveryWg.Add(1)
+		go func() {
+			defer discoveryWg.Done()
+			discoveryHits = runLANDiscovery(ctx, enrich.targetCIDR, enrich.discovery, logger)
+		}()
+	}
+
 	for result := range results {
 		byIP[result.ip] = append(byIP[result.ip], result.port)
 		if monitor != nil {
@@ -944,10 +989,14 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	if monitor != nil && total > 0 {
 		monitor.PortProgress(total, total)
 	}
+	discoveryWg.Wait()
 
 	_, ipNet, err := net.ParseCIDR(enrich.targetCIDR)
 	if err != nil {
 		return nil
+	}
+	if discoveryHits != nil {
+		mergeDiscoveryHosts(byIP, discoveryHits, ipNet)
 	}
 	arpByIP := arpCacheForTarget(ipNet)
 	arpDeadByIP := map[string]arpCacheEntry{}
@@ -985,7 +1034,7 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 		hostWorkers.Add(1)
 		go func() {
 			defer hostWorkers.Done()
-			host := enrichHost(ctx, ip, openPorts, enrich, timeout, arpByIP, arpDeadByIP, -1)
+			host := enrichHost(ctx, ip, openPorts, enrich, timeout, arpByIP, arpDeadByIP, discoveryHits, -1)
 			hostMu.Lock()
 			hosts = append(hosts, host)
 			hostMu.Unlock()
@@ -1036,14 +1085,25 @@ func scanIPPorts(ctx context.Context, ip string, ports []int, timeout time.Durat
 	return open
 }
 
-func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich enrichConfig, timeout time.Duration, arpByIP map[string]arpCacheEntry, arpDeadByIP map[string]arpCacheEntry, latencyMS int64) hostResult {
-	hostname := resolveHostname(ctx, ip, openPorts, timeout)
+func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich enrichConfig, timeout time.Duration, arpByIP map[string]arpCacheEntry, arpDeadByIP map[string]arpCacheEntry, discoveryByIP map[string]discoveryHit, latencyMS int64) hostResult {
+	var hit discoveryHit
+	if discoveryByIP != nil {
+		hit = discoveryByIP[ip]
+	}
+	if hit.IP == "" && len(hit.Sources) > 0 {
+		hit.IP = ip
+	}
+	hostname, nameSource := resolveHostnameWithSource(ctx, ip, openPorts, timeout)
 	var sysName, sysDescr string
 	if enrich.snmpCommunity != "" {
 		sysName, sysDescr = snmpGet(ctx, ip, enrich.snmpCommunity, minDuration(timeout, time.Second))
 	}
 	if hostname == "" {
 		hostname = sysName
+	}
+	hostname = discoveryHostnameFallback(hostname, hit)
+	if nameSource == "nbns" {
+		hit.Sources = appendSource(hit.Sources, "nbns")
 	}
 	arpEntry, inARP := arpByIP[ip]
 	mac := ""
@@ -1069,15 +1129,10 @@ func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich e
 			latency = ms
 		}
 	}
-	status := ""
-	guess := guessDevice(openPorts, sysDescr)
-	if enrich.arpCache {
-		if len(openPorts) > 0 {
-			status = "live"
-		} else if _, ok := arpDeadByIP[ip]; ok {
-			status = "arp"
-			guess = "offline"
-		}
+	status := discoveryHostStatus(openPorts, hit, enrich, arpDeadByIP, ip)
+	guess := guessDevice(openPorts, strings.TrimSpace(sysDescr+" "+discoveryGuessText(hit)))
+	if status == "arp" {
+		guess = "offline"
 	}
 	host := hostResult{
 		IP:         ip,
@@ -1094,13 +1149,19 @@ func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich e
 		Guess:      guess,
 		Status:     status,
 	}
+	applyDiscoveryFields(&host, hit)
 	fillARPFromCache(&host, enrich.targetCIDR)
 	return host
 }
 
-func shouldIncludeHost(openPorts []portResult, enrich enrichConfig, arpByIP map[string]arpCacheEntry, ip string) bool {
+func shouldIncludeHost(openPorts []portResult, enrich enrichConfig, arpByIP map[string]arpCacheEntry, ip string, discoveryByIP map[string]discoveryHit) bool {
 	if len(openPorts) > 0 {
 		return true
+	}
+	if enrich.discovery.enabled && discoveryByIP != nil {
+		if hit, ok := discoveryByIP[ip]; ok && (hit.IP != "" || len(hit.Sources) > 0) {
+			return true
+		}
 	}
 	if enrich.arpCache {
 		if _, ok := arpByIP[ip]; ok {
@@ -1441,13 +1502,18 @@ func reverseLookupContext(ctx context.Context, ip string) string {
 //     that have NetBIOS-over-TCP/IP disabled and no PTR record;
 //  3. a NetBIOS node-status query (UDP/137) for older SMB/Windows devices.
 func resolveHostname(ctx context.Context, ip string, openPorts []portResult, timeout time.Duration) string {
+	name, _ := resolveHostnameWithSource(ctx, ip, openPorts, timeout)
+	return name
+}
+
+func resolveHostnameWithSource(ctx context.Context, ip string, openPorts []portResult, timeout time.Duration) (string, string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	dnsCtx, cancel := context.WithTimeout(ctx, minDuration(timeout, 500*time.Millisecond))
 	defer cancel()
 	if name := reverseLookupContext(dnsCtx, ip); name != "" {
-		return name
+		return name, "ptr"
 	}
 
 	hasPort := func(port int) bool {
@@ -1460,10 +1526,13 @@ func resolveHostname(ctx context.Context, ip string, openPorts []portResult, tim
 	}
 	if hasPort(445) || hasPort(139) {
 		if name := smbHostname(ctx, ip, minDuration(2*timeout, 2*time.Second)); name != "" {
-			return name
+			return name, "smb"
 		}
 	}
-	return netbiosName(ctx, ip, minDuration(timeout, 750*time.Millisecond))
+	if name := netbiosName(ctx, ip, minDuration(timeout, 750*time.Millisecond)); name != "" {
+		return name, "nbns"
+	}
+	return "", ""
 }
 
 // nbnsNodeStatusQuery is a fixed NBNS node-status request for the wildcard name
@@ -1907,11 +1976,11 @@ func guessDevice(ports []portResult, extraText string) string {
 	}
 
 	switch {
-	case has(631) || has(9100) || containsText("printer", "jetdirect", "cups", "laserjet"):
+	case has(631) || has(9100) || containsText("printer", "jetdirect", "cups", "laserjet", "printdevice", "ipp"):
 		return "printer"
-	case has(554) || containsText("camera", "rtsp", "hikvision", "axis", "dahua", "webcam"):
+	case has(554) || containsText("camera", "rtsp", "hikvision", "axis", "dahua", "webcam", "networkcamera", "onvif"):
 		return "camera"
-	case has(2049) || has(548) || containsText("synology", "qnap", "truenas", "freenas", "diskstation"):
+	case has(2049) || has(548) || containsText("synology", "qnap", "truenas", "freenas", "diskstation", "mediaserver"):
 		return "nas"
 	case has(5060) || has(5061) || containsText("asterisk", "voip", "grandstream", "polycom"):
 		return "voip"
@@ -1919,10 +1988,12 @@ func guessDevice(ports []portResult, extraText string) string {
 		return "vm"
 	case containsText("cisco", "mikrotik", "routeros", "edgeos", "juniper", "aruba", "fortigate", "pfsense"):
 		return "network"
-	case has(135) || has(139) || has(445) || has(3389) || has(5985) || has(5986) || containsText("microsoft-iis", "windows server"):
+	case has(135) || has(139) || has(445) || has(3389) || has(5985) || has(5986) || containsText("microsoft-iis", "windows server", "wsd:", "workstation"):
 		return "windows"
 	case has(1433) || has(3306) || has(5432) || containsText("mariadb", "postgresql"):
 		return "db"
+	case containsText("samsung", "roku", "dlna", "mediarenderer", "googlecast", "airplay"):
+		return "media"
 	case has(22) || has(80) || has(443) || has(8080) || has(8443):
 		return "linux/device"
 	default:
@@ -2250,7 +2321,12 @@ func writeCSV(path string, report scanReport, macFormat string) error {
 	w := csv.NewWriter(file)
 	defer w.Flush()
 
-	if err := w.Write([]string{"ip", "mac", "mac_vendor", "latency_ms", "hostname", "guess", "status", "arp_type", "arp_ifindex", "port", "service", "vendors", "banner", "http_status", "http_server", "http_title", "http_redirect", "tls_subject", "snmp_sysname", "snmp_sysdescr"}); err != nil {
+	if err := w.Write([]string{
+		"ip", "mac", "mac_vendor", "latency_ms", "hostname", "guess", "status", "arp_type", "arp_ifindex",
+		"discovery_sources", "mdns_name", "mdns_services", "llmnr_name", "ssdp_server", "upnp_type", "upnp_friendly", "upnp_model",
+		"wsd_types", "wsd_scopes",
+		"port", "service", "vendors", "banner", "http_status", "http_server", "http_title", "http_redirect", "tls_subject", "snmp_sysname", "snmp_sysdescr",
+	}); err != nil {
 		return err
 	}
 	for _, host := range report.Hosts {
@@ -2279,6 +2355,9 @@ func hostCSVRow(host hostResult, port portResult, macFormat string) []string {
 	return []string{
 		host.IP, formatMAC(host.MAC, macFormat), host.MACVendor, formatLatency(host.LatencyMS),
 		host.Hostname, host.Guess, host.Status, host.ARPType, strconv.FormatUint(uint64(host.ARPIfIndex), 10),
+		strings.Join(host.DiscoverySources, ";"), host.MDNSName, strings.Join(host.MDNSServices, ";"),
+		host.LLMNRName, host.SSDPServer, host.UPnPType, host.UPnPFriendly, host.UPnPModel,
+		strings.Join(host.WSDTypes, ";"), strings.Join(host.WSDScopes, ";"),
 		portNum, service, port.Vendors,
 		port.Banner, port.HTTPStatus, port.HTTPServer, port.HTTPTitle, port.HTTPRedirect, port.TLSSubject,
 		host.SysName, host.SysDescr,
