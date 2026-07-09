@@ -5,235 +5,181 @@
 [![Platform](https://img.shields.io/badge/platform-windows-0078D6?logo=windows&logoColor=white)](#)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Ipscry is a small Windows-oriented local network inventory scanner designed for
-on-demand NinjaRMM execution. It uses normal TCP connect attempts only and writes
-auditable JSON, CSV, and log artifacts.
+Ipscry is a small Windows network inventory scanner. It finds hosts on a local
+network, checks common TCP ports, and reports hostnames, MAC vendors, service
+labels, banners, HTTP metadata, TLS certificate subjects, and optional SNMP
+details.
+
+Ipscry uses ordinary TCP connect attempts only. It does not use raw sockets, SYN
+scans, packet-capture drivers, credential checks, exploit probes, runtime
+downloads, or external lookup APIs.
 
 > [!IMPORTANT]
 > Only scan networks you own or are explicitly authorized to assess. See
-> [Responsible use](#responsible-use) and [SECURITY.md](SECURITY.md).
+> [Responsible Use](#responsible-use) and [SECURITY.md](SECURITY.md).
 
-## Features
+## Download
 
-- **Connect-only TCP scanning** — no raw sockets, SYN scans, or packet-capture
-  drivers, so it stays friendly to managed AV/EDR.
-- **Layered hostname resolution** — reverse DNS, anonymous SMB2/NTLM negotiation,
-  and NetBIOS node status, so modern and legacy Windows hosts both resolve.
-- **Lightweight service fingerprinting** — banners, HTTP status/server/title, and
-  TLS certificate subjects, plus a heuristic device-type guess.
-- **Optional enrichment** — SNMP v2c system group, embedded port-service metadata,
-  and offline MAC vendor lookup (local subnet).
-- **Auditable artifacts** — deterministic JSON, CSV, and a UTC audit log.
-- **Single static binary** — no runtime dependencies; trivial to stage and
-  allowlist by hash.
+Download the latest Windows build from the
+[GitHub releases page](https://github.com/imagenetmit/ipscry/releases).
 
-## Contents
+Use the `ipscry-windows-amd64.zip` archive for a normal download. It contains:
 
-- [Build](#build)
-- [Run](#run)
-- [Port selection](#port-selection)
-- [Name resolution](#name-resolution)
-- [MAC vendor lookup](#mac-vendor-lookup)
-- [Internal Signing](#internal-signing)
-- [AV/EDR Posture](#avedr-posture)
-- [Responsible use](#responsible-use)
-- [Contributing](#contributing)
-- [License](#license)
+- `ipscry.exe`
+- `README.md`
+- `LICENSE`
+- `SECURITY.md`
+- `CHANGELOG.md`
 
-## Build
+You can also download `ipscry.exe` directly from the release assets.
 
-Install Go 1.26 or newer, then build a normal uncompressed Windows executable:
+## Quick Start
 
-```powershell
-go build -trimpath -o ipscry.exe .
-```
-
-## Run
-
-Interactive scan (results print to the console; no files written unless requested):
+Run a scan from PowerShell:
 
 ```powershell
 .\ipscry.exe scan
 ```
 
-Explicit CIDR:
+With no target, Ipscry scans the active local `/24` network.
+
+Scan a specific CIDR:
 
 ```powershell
 .\ipscry.exe scan 192.168.1.0/24
 ```
 
-Pass `-j`, `-C`, and/or `-L` with paths when you want artifacts on disk. NinjaRMM
-(or other unattended runners) typically sets all three — for example:
+Show the version:
 
 ```powershell
-C:\imagenet\ipscry.exe scan --json C:\imagenet\scan.json --csv C:\imagenet\scan.csv --log C:\imagenet\scan.log
+.\ipscry.exe version
 ```
 
-## Live terminal UI
+## Output
 
-When run interactively, `ipscry` shows a live terminal UI (TUI) by default: a
-real-time scan progress bar, a results table, ongoing host watch, scrollable host
-list (arrows / PageUp / PageDown / Home / End), in-UI export (`c` CSV, `j`
-JSON, `t` TXT), full re-scan (`r`), and watch toggles: `p` auto-ping, `s`
-auto-scan (background rescan every 3 minutes). Press Enter to exit.
+By default, Ipscry prints results to the console and does not write files.
 
-The TUI is **automatically disabled** when an output path (`-j`, `-C`, or `-L`) is
-requested or when there is no interactive terminal (piped/unattended runs), so RMM
-and automation behavior is unchanged. Use `-N`/`--no-tui` to disable it explicitly.
-Set `NO_COLOR` to disable ANSI colors.
+Write JSON, CSV, or a log only when you pass an output path:
 
-TUI mode is limited to `/22` and smaller targets (about 1022 hosts). `/23` and
-`/22` scans prompt for confirmation first; larger networks are rejected with a
-message to split the scan into `/24`, `/23`, or `/22` chunks or use `--no-tui`.
+```powershell
+.\ipscry.exe scan 192.168.1.0/24 -j scan.json -C scan.csv -L scan.log
+```
 
-Use `-R`/`--arp-detail` to show ARP neighbor **State**, **Alias**, and **Index**
-columns in the TUI (hidden by default).
+Post the JSON report to a webhook after the scan:
 
-### Watch behaviour and latency stats
+```powershell
+.\ipscry.exe scan 192.168.1.0/24 -w https://example.test/webhook
+```
 
-During watch the table shows per-host `min`/`max`/`avg` latency (avg is a moving
-average of the last 6 successful pings) while **auto-ping** is on (toggle with
-`p`; on by default). Responsive hosts are pinged on a relaxed 5s sweep. When a
-host that was responding **misses one ping**, its `ms` cell shows a `-` (flagged
-`!` in the status column) and it is re-probed once per second; the cell fades
-progressively redder with each consecutive miss and the host is marked `down`
-after 10 misses (~10s). A single successful reply resets it to the 5s sweep.
+The JSON and CSV outputs include full service labels, vendor metadata, HTTP
+details, redirects, MAC vendor names, and probe errors when available.
 
-**Auto-scan** (`s` toggle; off by default) runs a full background rescan every
-3 minutes. Manual `r` still triggers an immediate rescan.
+## Live Terminal UI
 
-## Port selection
+Interactive scans open a live terminal UI by default. It shows scan progress,
+live host rows, latency, open ports, hostnames, MAC addresses, and watch status.
 
-By default (or with `--ports common`), ipscry scans every port listed in the
-embedded [`data/ports.csv`](data/ports.csv) — currently **92 ports** from 20 through
-28017 (FTP, SSH, HTTP/S, SMB, RDP, databases, dev/alternate bindings, and similar).
-That file is the single source of truth for both the default scan set and the
-service/vendor metadata compiled into the binary. Edit it and rebuild to change
-defaults.
+Useful keys:
 
-`--ports` also accepts named profiles, an explicit list, or ranges:
+- `Enter` exits after the scan completes.
+- `c`, `j`, and `t` export CSV, JSON, or TXT from the finished scan.
+- `p` toggles auto-ping.
+- `s` toggles a background rescan every 3 minutes.
+- `r` starts a manual rescan.
+- `a` toggles ARP-dead rows.
+- Arrow keys, PageUp, PageDown, Home, and End scroll the host list.
+
+The TUI is automatically disabled when you pass `-j`, `-C`, `-L`, or `-w`, or
+when there is no interactive terminal. Use `-N` or `--no-tui` to disable it
+explicitly.
+
+TUI mode is limited to `/22` and smaller targets. `/23` and `/22` scans ask for
+confirmation first; larger targets should be split into smaller ranges or run
+with `--no-tui`.
+
+## Common Options
+
+```text
+ipscry scan [CIDR] [options]
+
+Target:
+  no CIDR              scan the active local /24
+  192.168.1.0/24      scan an explicit range
+
+Output:
+  -j, --json PATH      write JSON report
+  -C, --csv PATH       write CSV report
+  -L, --log PATH       write audit log
+  -w, --webhook URL    POST JSON report after scan
+  -P, --progress-webhook URL
+                       POST JSON progress events during the scan
+
+Display:
+  -N, --no-tui         disable the live terminal UI
+  -m, --mac-format colon|none|dash
+                       choose MAC address formatting
+  -a, --arp-dead       include offline hosts from the local ARP cache
+  -R, --arp-detail     show ARP State/Alias/Index columns in the TUI
+      --aip            print an Advanced IP Scanner-style results table
+
+Scanning:
+  -p, --ports LIST     common, web, windows, db, 22,80,443, or 8000-8100
+  -t, --timeout DURATION
+                       per-port timeout, such as 250ms or 1s
+  -c, --concurrency N  port-scan concurrency, 1-2048
+  -s, --snmp-community STRING
+                       SNMP v2c community for optional SNMP enrichment
+  -H, --http-timeout DURATION
+                       second-pass timeout for HTTP/HTTPS page retrieval
+```
+
+## What Ipscry Collects
+
+For each discovered host, Ipscry can report:
+
+- IP address
+- hostname from reverse DNS, anonymous SMB2/NTLM negotiation, or NetBIOS
+- MAC address and offline MAC vendor lookup for local-subnet hosts
+- open TCP ports and service labels
+- common product/vendor metadata from the embedded port database
+- HTTP status, server header, title, and redirects
+- TLS certificate subject
+- SNMP v2c system name and description when available
+- a simple device-type guess based on observed services
+
+MAC vendor and port metadata are embedded in the binary. Ipscry does not call an
+external API at runtime.
+
+## Port Selection
+
+By default, Ipscry scans every port listed in [`data/ports.csv`](data/ports.csv).
+That file is the source for both the default port list and the service/vendor
+metadata compiled into the release.
+
+`--ports` accepts named profiles, lists, and ranges:
 
 ```text
 --ports common          # all ports in data/ports.csv (default)
---ports web             # 80,443,631,8000,8008,8080,8443
---ports windows         # 135,139,445,1433,3389,5985,5986
---ports db              # 1433,3306,5432
+--ports web             # HTTP/HTTPS and common alternate web ports
+--ports windows         # SMB, RDP, WinRM, and common Windows services
+--ports db              # SQL Server, MySQL/MariaDB, PostgreSQL
 --ports 22,80,443       # explicit list
 --ports 8000-8100,9100  # ranges plus single ports
 ```
 
-Progress prints to stderr during non-TUI interactive scans. It stays off when the
-TUI is active or when `-j`, `-C`, or `-L` is set.
+## Responsible Use
 
-## Name resolution
+Ipscry is for authorized network inventory. Scanning networks without permission
+may be illegal and is outside the intended use of this project.
 
-For each discovered host the hostname is resolved through a layered fallback,
-because no single method covers every device:
+Name resolution may perform an unauthenticated SMB2 negotiation to read the
+computer name a server advertises. No credentials are sent and no SMB share is
+accessed.
 
-1. **Reverse DNS (PTR)** — authoritative FQDN when a record exists.
-2. **SMB/NTLM** (when 445 or 139 is open) — an anonymous SMB2 negotiation reads the
-   computer name the server advertises in its NTLM challenge. No credentials are
-   sent. This resolves modern Windows hosts that have NetBIOS-over-TCP/IP disabled
-   and no PTR record — the common "discovered but unnamed" case.
-3. **NetBIOS node status** (UDP/137) — for older SMB/Windows devices that still
-   answer `nbtstat`-style queries.
+## Development
 
-## MAC vendor lookup
-
-Each discovered host on the **local subnet** is enriched with its hardware MAC
-address (via Windows `SendARP`) and the vendor that owns the OUI. Lookups use an
-embedded IEEE OUI database — fully offline, no API calls.
-
-- MAC addresses are only available for hosts on the local subnet when scanning
-  the active local /24 (the default with no CIDR). Routed hosts reached via an
-  explicit CIDR will have no MAC.
-- Vendor names appear in JSON/CSV output and in the console table when known.
-
-## Port metadata
-
-Open ports include embedded service labels and common software/product names
-(`vendors` field in JSON/CSV). Labels and the default scan port list both come
-from [`data/ports.csv`](data/ports.csv). Application-layer probes (HTTP headers,
-TLS certificates, banners) still use probe flags in `main.go` for ports that need
-them; other listed ports get a plain TCP connect check.
-
-To regenerate the MAC vendor blob after updating the IEEE export:
-
-```powershell
-go run tools/gendata/main.go mac-vendors-export.json data/mac_vendors.csv.gz
-```
-
-## Internal Signing
-
-`VERSIONINFO.rc` contains the intended Windows version metadata. Compile it into
-a `.syso` resource on the build workstation if your build environment supports a
-Windows resource compiler, then run the normal Go build:
-
-```powershell
-windres -O coff -o versioninfo.syso VERSIONINFO.rc
-go build -trimpath -o ipscry.exe .
-```
-
-`build-windows.ps1` does this automatically when `windres` is available, and stamps
-the version into the binary from the current git tag (override with `-Version`):
-
-```powershell
-.\build-windows.ps1 -Version 1.2.3
-```
-
-Use an internal Authenticode code-signing certificate with the Code Signing EKU:
-
-```text
-1.3.6.1.5.5.7.3.3
-```
-
-Sign the executable after building:
-
-```powershell
-.\sign-windows.ps1 -CertificateName "Your Internal Code Signing Cert Name"
-```
-
-Verify on a managed endpoint:
-
-```powershell
-Get-AuthenticodeSignature .\ipscry.exe
-```
-
-Expected status:
-
-```text
-Valid
-```
-
-## AV/EDR Posture
-
-Ipscry intentionally avoids raw sockets, SYN scans, packet capture drivers,
-runtime downloads, credential checks, vulnerability probes, persistence, hidden
-execution, and script wrappers. Keep the binary path and hash stable per release
-if your managed AV/EDR supports allowlisting.
-
-Name resolution issues a standard, unauthenticated SMB2 negotiation to 445 (the
-same exchange `nmap -sV` / `smb-os-discovery` performs) to read the advertised
-computer name. No credentials are submitted and no SMB share is accessed; it is a
-read-only protocol negotiation over an ordinary TCP socket.
-
-Ipscry is fully offline by default. No runtime downloads, no external API calls.
-
-## Responsible use
-
-Ipscry is an inventory tool for networks you own or are explicitly authorized to
-assess. Scanning networks without authorization may be illegal and is always
-against the spirit of this project. By using ipscry you accept responsibility for
-ensuring you have permission to scan the target range. See [SECURITY.md](SECURITY.md)
-for the security posture and how to report a vulnerability.
-
-## Contributing
-
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the
-development workflow, and note that all participation is governed by our
-[Code of Conduct](CODE_OF_CONDUCT.md). In short: `go vet ./...` and `go test ./...`
-must pass, and changes should keep the AV/EDR posture intact (no raw sockets, no
-runtime downloads in the default path).
+Build, test, data regeneration, release, and contribution notes live in
+[`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## License
 
