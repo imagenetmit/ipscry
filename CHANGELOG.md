@@ -35,7 +35,7 @@ for tagged releases.
 - Removed the `--mac-vendor` flag; vendor lookup uses embedded OUI data.
 - Added `vendors` field to port results in JSON and CSV output.
 - Updated the project Go version to Go 1.26, with CI and release builds pinned
-  to Go 1.26.4.
+  to Go 1.26.5.
 
 ## [0.1.0] - 2026-06-22
 
