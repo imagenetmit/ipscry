@@ -8,6 +8,15 @@ for tagged releases.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-08
+
+### Added
+
+- Opt-in LAN discovery via `-d` / `--discovery` for SSDP/UPnP, mDNS, LLMNR, and
+  WS-Discovery, with `-D` / `--discovery-timeout` controlling the multicast window.
+- Discovery metadata in JSON and CSV output (`discovery_sources`, mDNS/UPnP/WS-Discovery
+  fields) and discovery-only hosts with `status: discovery`.
+
 ### Changed
 
 - TUI mode rejects targets larger than `/22` and prompts for confirmation on `/23`
@@ -41,5 +50,6 @@ for tagged releases.
 - Windows build, version metadata, RMM deployment guidance, and Authenticode
   signing helper scripts.
 
-[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/imagenetmit/ipscry/releases/tag/v0.1.0
