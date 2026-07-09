@@ -3,6 +3,7 @@
 /ipscry
 *.exe
 *.syso
+versioninfo.generated.rc
 
 # Scan artifacts
 scan.json
