@@ -17,8 +17,14 @@ for tagged releases.
 - Discovery metadata in JSON and CSV output (`discovery_sources`, mDNS/UPnP/WS-Discovery
   fields) and discovery-only hosts with `status: discovery`.
 
+## [0.1.1] - 2026-07-07
+
 ### Changed
 
+- Reworked project documentation for public release: the README now focuses on
+  downloading and running Ipscry, with build and contribution notes moved to
+  `DEVELOPMENT.md`.
+- Removed checked-in local/private artifacts from the public source tree.
 - TUI mode rejects targets larger than `/22` and prompts for confirmation on `/23`
   and `/22` scans because large result sets overwhelm the terminal UI.
 - Removed redundant CLI flags `--local`, `--progress`, and `--tui`; local /24 is
@@ -29,13 +35,13 @@ for tagged releases.
 - Removed the `--mac-vendor` flag; vendor lookup uses embedded OUI data.
 - Added `vendors` field to port results in JSON and CSV output.
 - Updated the project Go version to Go 1.26, with CI and release builds pinned
-  to Go 1.26.4.
+  to Go 1.26.5.
 
 ## [0.1.0] - 2026-06-22
 
 ### Added
 
-- Professional project documentation and GitHub community health files.
+- Project documentation and GitHub community health files.
 - Windows-oriented local network inventory scanner.
 - Connect-only TCP port scanning with configurable timeout, concurrency, and
   named port profiles.
@@ -47,9 +53,9 @@ for tagged releases.
 - Optional local-subnet MAC vendor lookup with deduplicated, rate-limited API
   calls.
 - JSON, CSV, and UTC audit log artifacts.
-- Windows build, version metadata, RMM deployment guidance, and Authenticode
-  signing helper scripts.
+- Windows build, version metadata, and Authenticode signing helper scripts.
 
 [Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/imagenetmit/ipscry/releases/tag/v0.2.0
+[0.2.0]: https://github.com/imagenetmit/ipscry/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/imagenetmit/ipscry/releases/tag/v0.1.0

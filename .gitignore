@@ -1,5 +1,6 @@
 # Build output
 /dist/
+/ipscry
 *.exe
 *.syso
 versioninfo.generated.rc
@@ -16,9 +17,10 @@ scan.log
 # Regeneration source (embedded data lives in data/)
 mac-vendors-export.json
 
-# Local Cursor state
-.cursor/hooks/state/
-.cursor/plans/embed_ports_and_mac_data_4da2adf3.plan.md
+# Local editor and agent state
+.cursor/
+.vscode/
+AGENTS.md
 security_tcp_ports_extended_http_dev.csv
 neighbor.csv
 endpoints.json

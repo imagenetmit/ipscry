@@ -122,6 +122,7 @@ type scanTUI struct {
 	rescanning       bool
 	autoPing         bool
 	autoScan         bool
+	autoARP          bool
 	done             chan struct{}
 	pulse            chan struct{}
 	once             sync.Once
@@ -232,7 +233,6 @@ func (t *scanTUI) HostReady(host hostResult) {
 		}
 	}
 	t.hosts = append(t.hosts, host)
-	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
 	if host.LatencyMS >= 0 {
 		t.recordPingLocked(host.IP, host.LatencyMS)
 	}
@@ -284,7 +284,6 @@ func (t *scanTUI) upsertPlaceholderLocked(ip string, latencyMS int64) {
 		return
 	}
 	t.hosts = append(t.hosts, hostResult{IP: ip, LatencyMS: latencyMS})
-	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
 }
 
 func hostRowPending(host hostResult) bool {
@@ -312,6 +311,7 @@ func (t *scanTUI) Finish(hosts []hostResult, elapsed time.Duration, ctx context.
 	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
 	t.autoPing = true
 	t.autoScan = false
+	t.autoARP = watch.enrich.arpCache
 	for i := range t.hosts {
 		if t.hosts[i].LatencyMS >= 0 {
 			t.recordPingLocked(t.hosts[i].IP, t.hosts[i].LatencyMS)
@@ -440,8 +440,12 @@ func (t *scanTUI) runFastProbe(ctx context.Context) {
 		} else {
 			changed = true // redraw so the fading-red ms cell advances
 		}
-		if hostStateChanged(before, t.hosts[i]) {
+		after := t.hosts[i]
+		if hostStateChanged(before, after) {
 			t.hostChangedAt[ip] = now
+		}
+		if after.Status == "dead" && before.Status != "dead" {
+			t.moveHostToBottomLocked(ip)
 		}
 	}
 	t.mu.Unlock()
@@ -598,7 +602,6 @@ func (t *scanTUI) addDiscoverPlaceholder(ip string, latencyMS int64) {
 		t.hostDiscoveredAt[ip] = time.Now()
 	}
 	t.hosts = append(t.hosts, hostResult{IP: ip, LatencyMS: latencyMS, Status: status})
-	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
 	if latencyMS >= 0 {
 		t.recordPingLocked(ip, latencyMS)
 	}
@@ -624,7 +627,6 @@ func (t *scanTUI) upsertHost(host hostResult) {
 	}
 	t.recordPingLocked(host.IP, host.LatencyMS)
 	t.hosts = append(t.hosts, host)
-	sort.Slice(t.hosts, func(i, j int) bool { return lessIP(t.hosts[i].IP, t.hosts[j].IP) })
 	t.scheduleDraw()
 }
 
@@ -796,6 +798,16 @@ func (t *scanTUI) indexOfLocked(ip string) int {
 	return -1
 }
 
+func (t *scanTUI) moveHostToBottomLocked(ip string) {
+	i := t.indexOfLocked(ip)
+	if i < 0 || i == len(t.hosts)-1 {
+		return
+	}
+	host := t.hosts[i]
+	copy(t.hosts[i:], t.hosts[i+1:])
+	t.hosts[len(t.hosts)-1] = host
+}
+
 // missColor returns a 256-color red escape that intensifies with the miss count
 // so a struggling host's ms cell fades steadily redder. It honors NO_COLOR by
 // returning "" whenever the base red has been blanked at startup.
@@ -955,6 +967,8 @@ func (t *scanTUI) WaitExit(ctx context.Context) {
 				t.toggleAutoPing()
 			case keyAutoScan:
 				t.toggleAutoScan()
+			case keyARP:
+				t.toggleARP()
 			case keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom:
 				t.scroll(k)
 			}
@@ -975,6 +989,7 @@ const (
 	keyMacFormat
 	keyAutoPing
 	keyAutoScan
+	keyARP
 	keyUp
 	keyDown
 	keyPageUp
@@ -1007,6 +1022,8 @@ func readKey(r *bufio.Reader) (tuiKey, error) {
 		return keyAutoPing, nil
 	case 's', 'S':
 		return keyAutoScan, nil
+	case 'a', 'A':
+		return keyARP, nil
 	case 'k':
 		return keyUp, nil
 	case 'g':
@@ -1101,6 +1118,8 @@ func lineCommand(line string) tuiKey {
 		return keyAutoPing
 	case 's', 'S':
 		return keyAutoScan
+	case 'a', 'A':
+		return keyARP
 	}
 	return keyNone
 }
@@ -1164,13 +1183,8 @@ func (t *scanTUI) triggerRescan(ctx context.Context) {
 	total := int64(len(watch.ips) * len(watch.ports))
 	t.rescanning = true
 	t.phase = "scanning"
-	t.hosts = nil
 	t.scanHosts = map[string]int64{}
 	t.hostTotal = 0
-	t.scrollOff = 0
-	t.pingStats = map[string]*hostPingStats{}
-	t.hostDiscoveredAt = map[string]time.Time{}
-	t.hostChangedAt = map[string]time.Time{}
 	t.watchPopulated = false
 	t.scanned.Store(0)
 	t.total.Store(total)
@@ -1185,12 +1199,13 @@ func (t *scanTUI) triggerRescan(ctx context.Context) {
 }
 
 func (t *scanTUI) applyRescanResults(hosts []hostResult, elapsed time.Duration, watch tuiWatchConfig) {
-	sort.Slice(hosts, func(i, j int) bool { return lessIP(hosts[i].IP, hosts[j].IP) })
 	t.mu.Lock()
+	now := time.Now()
 	t.rescanning = false
 	t.phase = "watch"
 	t.elapsed = elapsed
-	t.hosts = append([]hostResult(nil), hosts...)
+	t.ensureMapsLocked()
+	t.hosts = t.reconcileRescanHostsLocked(hosts, now)
 	t.hostTotal = len(hosts)
 	for i := range t.hosts {
 		if t.hosts[i].LatencyMS >= 0 {
@@ -1202,6 +1217,58 @@ func (t *scanTUI) applyRescanResults(hosts []hostResult, elapsed time.Duration, 
 		watch.logger.Printf("tui rescan completed hosts=%d duration=%s", len(hosts), elapsed)
 	}
 	t.scheduleDraw()
+}
+
+func (t *scanTUI) ensureMapsLocked() {
+	if t.hostDiscoveredAt == nil {
+		t.hostDiscoveredAt = map[string]time.Time{}
+	}
+	if t.hostChangedAt == nil {
+		t.hostChangedAt = map[string]time.Time{}
+	}
+	if t.pingStats == nil {
+		t.pingStats = map[string]*hostPingStats{}
+	}
+}
+
+func (t *scanTUI) reconcileRescanHostsLocked(hosts []hostResult, now time.Time) []hostResult {
+	byIP := make(map[string]hostResult, len(hosts))
+	for _, host := range hosts {
+		byIP[host.IP] = host
+	}
+
+	next := make([]hostResult, 0, len(t.hosts)+len(hosts))
+	dropped := make([]hostResult, 0)
+	seen := make(map[string]struct{}, len(hosts))
+	for _, old := range t.hosts {
+		if host, ok := byIP[old.IP]; ok {
+			if t.watchPopulated && hostStateChanged(old, host) {
+				t.hostChangedAt[host.IP] = now
+			}
+			next = append(next, host)
+			seen[host.IP] = struct{}{}
+			continue
+		}
+
+		if old.Status != "dead" {
+			t.hostChangedAt[old.IP] = now
+		}
+		old.Status = "dead"
+		old.LatencyMS = -1
+		dropped = append(dropped, old)
+	}
+	next = append(next, dropped...)
+
+	for _, host := range hosts {
+		if _, ok := seen[host.IP]; ok {
+			continue
+		}
+		if t.phase == "watch" {
+			t.hostDiscoveredAt[host.IP] = now
+		}
+		next = append(next, host)
+	}
+	return next
 }
 
 func cycleMacFormat(current string) string {
@@ -1252,6 +1319,18 @@ func (t *scanTUI) toggleAutoScan() {
 	t.autoScan = !t.autoScan
 	on := t.autoScan
 	t.exportStatus = "auto-scan " + onOffLabel(on)
+	t.exportErr = false
+	t.exportStatusAt = time.Now()
+	t.mu.Unlock()
+	t.scheduleDraw()
+}
+
+func (t *scanTUI) toggleARP() {
+	t.mu.Lock()
+	t.autoARP = !t.autoARP
+	on := t.autoARP
+	t.watch.enrich.arpCache = on
+	t.exportStatus = "arp-dead " + onOffLabel(on)
 	t.exportErr = false
 	t.exportStatusAt = time.Now()
 	t.mu.Unlock()
@@ -1378,6 +1457,7 @@ func (t *scanTUI) draw() {
 	exportErr := false
 	autoPing := t.autoPing
 	autoScan := t.autoScan
+	autoARP := t.autoARP
 	if t.exportStatus != "" && time.Since(t.exportStatusAt) < tuiExportStatusTTL {
 		exportStatus = t.exportStatus
 		exportErr = t.exportErr
@@ -1438,10 +1518,11 @@ func (t *scanTUI) draw() {
 
 	b.WriteString("\n")
 	if phase == "watch" || phase == "done" {
-		fmt.Fprintf(&b, "%sr rescan · %sp ping %s%s%s · %ss scan %s%s%s · m mac · q quit · c csv · j json · t txt%s\n",
+		fmt.Fprintf(&b, "%sr rescan · %sp ping %s%s%s · %ss scan %s%s%s · %sa arp %s%s%s · m mac · q quit · c csv · j json · t txt%s\n",
 			escDim,
 			toggleOnColor(autoPing), onOffLabel(autoPing), escReset, escDim,
-			toggleOnColor(autoScan), onOffLabel(autoScan), escReset, escDim, escReset)
+			toggleOnColor(autoScan), onOffLabel(autoScan), escReset, escDim,
+			toggleOnColor(autoARP), onOffLabel(autoARP), escReset, escDim, escReset)
 		if exportStatus != "" {
 			color := escGreen
 			if exportErr {
@@ -1551,7 +1632,8 @@ func (t *scanTUI) drawHostRows(b *strings.Builder, hosts []hostResult, hostTotal
 	}
 
 	lay := tuiDoneLayout(cols, showARP)
-	b.WriteString(escBold + escBrightCyan)
+	b.WriteString(escBold)
+	b.WriteString(escBrightCyan)
 	if showARP {
 		fmt.Fprintf(b, "%-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s\n",
 			lay.st, "S", lay.ip, "IP", lay.name, "Name", lay.mac, "MAC", lay.vendor, "Vendor", lay.ports, "Ports",

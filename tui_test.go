@@ -296,6 +296,47 @@ func TestToggleAutoScan(t *testing.T) {
 	}
 }
 
+func TestToggleARP(t *testing.T) {
+	tui := &scanTUI{}
+	tui.toggleARP()
+	if !tui.autoARP || !tui.watch.enrich.arpCache {
+		t.Fatal("expected arp-dead on")
+	}
+	if tui.exportStatus != "arp-dead on" {
+		t.Fatalf("status=%q", tui.exportStatus)
+	}
+}
+
+func TestApplyRescanResultsKeepsStableOrder(t *testing.T) {
+	tui := &scanTUI{
+		out:              io.Discard,
+		phase:            "watch",
+		hostDiscoveredAt: map[string]time.Time{},
+		hostChangedAt:    map[string]time.Time{},
+		pingStats:        map[string]*hostPingStats{},
+		watchPopulated:   true,
+		hosts: []hostResult{
+			{IP: "10.0.0.5", LatencyMS: 5, Status: "live", OpenPorts: []portResult{{Port: 80}}},
+			{IP: "10.0.0.20", LatencyMS: 8, Status: "live", OpenPorts: []portResult{{Port: 445}}},
+		},
+	}
+
+	tui.applyRescanResults([]hostResult{
+		{IP: "10.0.0.20", LatencyMS: 7, Status: "live", OpenPorts: []portResult{{Port: 445}}},
+		{IP: "10.0.0.10", LatencyMS: 4, Status: "live", OpenPorts: []portResult{{Port: 22}}},
+	}, time.Second, tuiWatchConfig{})
+
+	want := []string{"10.0.0.20", "10.0.0.5", "10.0.0.10"}
+	for i, ip := range want {
+		if tui.hosts[i].IP != ip {
+			t.Fatalf("hosts[%d]=%q, want %q in order %+v", i, tui.hosts[i].IP, ip, tui.hosts)
+		}
+	}
+	if tui.hosts[1].Status != "dead" || tui.hosts[1].LatencyMS != -1 {
+		t.Fatalf("dropped host should move to bottom as dead: %+v", tui.hosts[1])
+	}
+}
+
 func TestExportResults(t *testing.T) {
 	t.Chdir(t.TempDir())
 	tui := &scanTUI{
@@ -372,6 +413,25 @@ func TestHostReadyReplacesPlaceholder(t *testing.T) {
 	}
 	if tui.hosts[0].MAC == "" || hostRowPending(tui.hosts[0]) {
 		t.Fatalf("placeholder not replaced: %+v", tui.hosts[0])
+	}
+}
+
+func TestTUILiveInsertionsAppendWithoutResorting(t *testing.T) {
+	tui := &scanTUI{
+		out:              io.Discard,
+		hostDiscoveredAt: map[string]time.Time{},
+		pingStats:        map[string]*hostPingStats{},
+		phase:            "watch",
+	}
+	tui.hosts = []hostResult{
+		{IP: "10.0.0.5", LatencyMS: 10},
+		{IP: "10.0.0.20", LatencyMS: 10},
+	}
+
+	tui.addDiscoverPlaceholder("10.0.0.10", 12)
+
+	if got := tui.hosts[2].IP; got != "10.0.0.10" {
+		t.Fatalf("new live host should append at bottom, got order %+v", tui.hosts)
 	}
 }
 
@@ -475,9 +535,9 @@ func TestTriggerRescanIgnoresWhenBusy(t *testing.T) {
 
 func TestReadKey(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader(
-		"mrcqps\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOAk \x1b[1;5A\x1b[3~"))
+		"mrcqpsa\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOAk \x1b[1;5A\x1b[3~"))
 	want := []tuiKey{
-		keyMacFormat, keyRescan, keyCSV, keyExit, keyAutoPing, keyAutoScan, keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom,
+		keyMacFormat, keyRescan, keyCSV, keyExit, keyAutoPing, keyAutoScan, keyARP, keyUp, keyDown, keyPageUp, keyPageDown, keyTop, keyBottom,
 		keyUp, keyUp, keyPageDown, keyTop, keyNone,
 	}
 	for i, w := range want {
