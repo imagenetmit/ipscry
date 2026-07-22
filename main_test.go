@@ -30,6 +30,43 @@ func TestParsePortsCommon(t *testing.T) {
 	}
 }
 
+func TestStreamJSONFlagDisablesTUIAndConsoleProgress(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "--stream-json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.StreamJSON || cfg.TUI || cfg.Progress {
+		t.Fatalf("stream=%v tui=%v progress=%v", cfg.StreamJSON, cfg.TUI, cfg.Progress)
+	}
+}
+
+func TestStreamJSONMonitorEmitsIncrementalEvents(t *testing.T) {
+	var output bytes.Buffer
+	monitor := newStreamJSONMonitor(&output, "192.168.1.0/24")
+	monitor.Start("192.168.1.0/24", 10, enrichConfig{})
+	monitor.PortFound(portScanResult{
+		ip:   "192.168.1.10",
+		port: portResult{Port: 443, Service: "https", HTTPStatus: "200 OK"},
+	})
+	monitor.HostReady(hostResult{
+		IP: "192.168.1.10", Hostname: "switch.local",
+		OpenPorts: []portResult{{Port: 443, Service: "https", TLSSubject: "CN=switch"}},
+	})
+	monitor.Finish(nil, time.Second, context.Background(), tuiWatchConfig{})
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("got %d events: %s", len(lines), output.String())
+	}
+	var found map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &found); err != nil {
+		t.Fatal(err)
+	}
+	if found["event"] != "target_found" || found["protocol"] != "https" {
+		t.Fatalf("unexpected target event: %#v", found)
+	}
+}
+
 func TestParsePortsDedupesAndSorts(t *testing.T) {
 	ports, err := parsePorts("443,22,443,80")
 	if err != nil {

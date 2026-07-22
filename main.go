@@ -116,6 +116,7 @@ type scanConfig struct {
 	LogPath          string
 	WebhookURL       string
 	ProgressURL      string
+	StreamJSON       bool
 	MACFormat        string
 	ARPCache         bool
 	AIP              bool
@@ -263,6 +264,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	var monitor scanMonitor
 	var tui *scanTUI
 	var progressMonitor *webhookProgressMonitor
+	var streamMonitor *streamJSONMonitor
 	if cfg.TUI {
 		tui, err = newScanTUI(stdout)
 		if err != nil {
@@ -279,6 +281,14 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 			monitor = progressMonitor
 		} else {
 			monitor = multiScanMonitor{monitor, progressMonitor}
+		}
+	}
+	if cfg.StreamJSON {
+		streamMonitor = newStreamJSONMonitor(stdout, cfg.Target)
+		if monitor == nil {
+			monitor = streamMonitor
+		} else {
+			monitor = multiScanMonitor{monitor, streamMonitor}
 		}
 	}
 	if !cfg.TUI && cfg.Progress {
@@ -315,6 +325,9 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	if progressMonitor != nil {
 		progressMonitor.Finish(hosts, elapsed, ctx, tuiWatchConfig{})
 	}
+	if streamMonitor != nil {
+		streamMonitor.Finish(hosts, elapsed, ctx, tuiWatchConfig{})
+	}
 
 	for _, host := range hosts {
 		logger.Printf("host ip=%s mac=%s latency_ms=%d status=%s arp_type=%s arp_ifindex=%d mac_vendor=%s hostname=%s guess=%s",
@@ -338,7 +351,9 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 
 	logger.Printf("completed_at=%s discovered_hosts=%d duration=%s", completed.Format(time.RFC3339), len(hosts), elapsed)
-	if tui != nil {
+	if cfg.StreamJSON {
+		return nil
+	} else if tui != nil {
 		tui.WaitExit(ctx)
 	} else if cfg.AIP {
 		printAIPTable(stdout, report, cfg.MACFormat)
@@ -380,6 +395,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	logPath := fs.String("log", "", "write audit log to path")
 	webhookURL := fs.String("webhook", "", "POST JSON results to URL")
 	progressURL := fs.String("progress-webhook", "", "POST JSON progress events to URL")
+	streamJSON := fs.Bool("stream-json", false, "write incremental NDJSON events to stdout")
 	macFormat := fs.String("mac-format", "colon", "MAC format: colon, none, dash")
 	arpCache := fs.Bool("arp-dead", false, "include IPs from the local ARP cache with no open ports")
 	arpDetail := fs.Bool("arp-detail", false, "show ARP State/Alias/Index columns in the TUI")
@@ -421,6 +437,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 		}
 		cfg.ProgressURL = parsed
 	}
+	cfg.StreamJSON = *streamJSON
 	cfg.MACFormat = strings.ToLower(strings.TrimSpace(*macFormat))
 	cfg.ARPCache = *arpCache
 	cfg.TUIARPDetail = *arpDetail
@@ -438,7 +455,7 @@ func parseScanArgs(args []string) (scanConfig, error) {
 
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	hasOutputPath := set["json"] || set["csv"] || set["log"] || set["webhook"] || set["progress-webhook"]
+	hasOutputPath := set["json"] || set["csv"] || set["log"] || set["webhook"] || set["progress-webhook"] || set["stream-json"]
 
 	cfg.TUI = !*noTUI && !hasOutputPath
 	cfg.Progress = !cfg.TUI && !hasOutputPath
@@ -520,7 +537,7 @@ func normalizeFlagToken(arg string) (string, error) {
 	if long, ok := scanFlagAliases[body]; ok {
 		return "--" + long + suffix, nil
 	}
-	if scanValueFlags[body] || body == "no-tui" || body == "arp-dead" || body == "arp-detail" || body == "aip" {
+	if scanValueFlags[body] || body == "no-tui" || body == "stream-json" || body == "arp-dead" || body == "arp-detail" || body == "aip" {
 		return "--" + body + suffix, nil
 	}
 	return "", fmt.Errorf("unknown flag %s", arg)
@@ -578,6 +595,7 @@ Options:
   -w, --webhook URL     POST JSON results to HTTP endpoint (optional)
   -P, --progress-webhook URL
                          POST JSON progress events to HTTP endpoint (optional)
+      --stream-json      write incremental NDJSON events to stdout
   -m, --mac-format colon|none|dash
   -a, --arp-dead        include offline hosts from the local ARP cache
   -R, --arp-detail      show ARP State/Alias/Index columns in the TUI
@@ -979,6 +997,9 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 		byIP[result.ip] = append(byIP[result.ip], result.port)
 		if monitor != nil {
 			monitor.PortOpen(result.ip, result.latencyMS)
+			if detailed, ok := monitor.(interface{ PortFound(portScanResult) }); ok {
+				detailed.PortFound(result)
+			}
 		}
 		logger.Printf("open ip=%s port=%d service=%s", result.ip, result.port.Port, result.port.Service)
 	}
