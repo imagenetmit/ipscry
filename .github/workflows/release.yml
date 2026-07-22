@@ -57,6 +57,9 @@ jobs:
       - name: Package artifact
         shell: pwsh
         run: |
+          Get-FileHash dist/ipscry.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  ipscry.exe" } |
+            Set-Content dist/ipscry.exe.sha256
           New-Item -ItemType Directory -Force dist/package | Out-Null
           Copy-Item dist/ipscry.exe dist/package/ipscry.exe
           Copy-Item README.md,LICENSE,SECURITY.md,CHANGELOG.md dist/package/
@@ -71,6 +74,7 @@ jobs:
         with:
           files: |
             dist/ipscry.exe
+            dist/ipscry.exe.sha256
             dist/ipscry-windows-amd64.zip
             dist/ipscry-windows-amd64.zip.sha256
           generate_release_notes: true
