@@ -8,6 +8,17 @@ for tagged releases.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-22
+
+### Added
+
+- `--stream-json` for incremental NDJSON event output to stdout during scans,
+  with automatic TUI and stderr progress disabled when enabled.
+
+### Changed
+
+- CI and release workflows use `actions/setup-go@v7`.
+
 ## [0.2.0] - 2026-07-08
 
 ### Added
@@ -55,7 +66,8 @@ for tagged releases.
 - JSON, CSV, and UTC audit log artifacts.
 - Windows build, version metadata, and Authenticode signing helper scripts.
 
-[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/imagenetmit/ipscry/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/imagenetmit/ipscry/releases/tag/v0.1.0
