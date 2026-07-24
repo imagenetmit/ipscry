@@ -103,7 +103,9 @@ Get-AuthenticodeSignature .\dist\ipscry.exe
 ```
 
 The GitHub release workflow signs release assets through Azure Artifact Signing
-when the required repository secrets are configured.
+when the required repository secrets are configured. See
+[`CODE_SIGNING.md`](CODE_SIGNING.md) for the complete Azure, OIDC, GitHub
+Environment, and verification setup.
 
 ## Pull Requests
 
