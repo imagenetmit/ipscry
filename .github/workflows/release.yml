@@ -11,7 +11,52 @@ permissions:
   id-token: write
 
 jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          check-latest: true
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Build Linux executable
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA}"
+          fi
+          go build -trimpath -ldflags "-X main.appVersion=${version}" -o dist/ipscry-linux-amd64 .
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist/package
+          cp dist/ipscry-linux-amd64 dist/package/ipscry
+          cp README.md LICENSE SECURITY.md CHANGELOG.md dist/package/
+          tar -czf dist/ipscry-linux-amd64.tar.gz -C dist/package .
+          cd dist
+          sha256sum ipscry-linux-amd64 > ipscry-linux-amd64.sha256
+          sha256sum ipscry-linux-amd64.tar.gz > ipscry-linux-amd64.tar.gz.sha256
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipscry-linux-amd64
+          path: |
+            dist/ipscry-linux-amd64
+            dist/ipscry-linux-amd64.sha256
+            dist/ipscry-linux-amd64.tar.gz
+            dist/ipscry-linux-amd64.tar.gz.sha256
+
   release:
+    needs: build-linux
     environment:
       name: ${{ vars.RELEASE_SIGNING_ENVIRONMENT }}
     runs-on: windows-latest
@@ -24,6 +69,12 @@ jobs:
         with:
           go-version: "1.26.5"
           check-latest: true
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ipscry-linux-amd64
+          path: dist
 
       - name: Test
         shell: pwsh
@@ -77,4 +128,8 @@ jobs:
             dist/ipscry.exe.sha256
             dist/ipscry-windows-amd64.zip
             dist/ipscry-windows-amd64.zip.sha256
+            dist/ipscry-linux-amd64
+            dist/ipscry-linux-amd64.sha256
+            dist/ipscry-linux-amd64.tar.gz
+            dist/ipscry-linux-amd64.tar.gz.sha256
           generate_release_notes: true
