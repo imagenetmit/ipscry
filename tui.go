@@ -15,7 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
 
 const (
@@ -871,10 +872,9 @@ func spinnerFrame(n int64) string {
 	return string(spinnerFrames[int(n)%len(spinnerFrames)])
 }
 
-// padRight left-aligns s in a field of width display columns, counting runes so
-// multibyte glyphs (·, ○, ●, …) stay aligned where %-*s would over-count bytes.
+// padRight left-aligns s in a field of terminal display columns.
 func padRight(s string, width int) string {
-	n := utf8.RuneCountInString(s)
+	n := runewidth.StringWidth(s)
 	if n >= width {
 		return s
 	}

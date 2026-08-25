@@ -8,6 +8,17 @@ for tagged releases.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-25
+
+### Added
+
+- Linux AMD64 release binaries, archives, and SHA-256 checksums.
+
+### Fixed
+
+- TUI column alignment after host resolution when names contain Unicode or
+  terminal control characters.
+
 ## [0.3.0] - 2026-07-22
 
 ### Added
@@ -66,7 +77,8 @@ for tagged releases.
 - JSON, CSV, and UTC audit log artifacts.
 - Windows build, version metadata, and Authenticode signing helper scripts.
 
-[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/imagenetmit/ipscry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/imagenetmit/ipscry/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/imagenetmit/ipscry/compare/v0.1.0...v0.1.1

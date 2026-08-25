@@ -224,6 +224,9 @@ func TestPadRight(t *testing.T) {
 	if got := padRight("·", 3); got != "·  " {
 		t.Fatalf("multibyte pad = %q", got)
 	}
+	if got := padRight("界", 3); got != "界 " {
+		t.Fatalf("wide-rune pad = %q", got)
+	}
 	if got := padRight("ab", 1); got != "ab" {
 		t.Fatalf("overflow should not truncate: %q", got)
 	}
@@ -274,6 +277,13 @@ func TestFormatTuiNameDisplay(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "...") {
 		t.Fatalf("expected ellipsis truncation: %q", got)
+	}
+}
+
+func TestFormatTuiNameDisplayUsesTerminalWidth(t *testing.T) {
+	got := tuiNameCell(hostResult{Hostname: "café\t界"}, tuiNameWidth)
+	if strings.ContainsRune(got, '\t') || utf8.RuneCountInString(got) != tuiNameWidth-1 {
+		t.Fatalf("unsafe or incorrectly padded terminal cell: %q", got)
 	}
 }
 

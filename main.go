@@ -28,8 +28,11 @@ import (
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
 
 const (
@@ -50,7 +53,7 @@ const (
 // appVersion is overridable at build time:
 //
 //	go build -ldflags "-X main.appVersion=1.2.3"
-var appVersion = "0.3.0"
+var appVersion = "0.3.1"
 
 // portInfo is the single source of truth for a known port: its service label and
 // which application-layer probes apply. Adding a port is a one-line edit here.
@@ -2450,13 +2453,20 @@ func truncDisplay(s string, max int) string {
 	if max <= 0 {
 		return ""
 	}
-	if len(s) <= max {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, s)
+	if runewidth.StringWidth(s) <= max {
 		return s
 	}
-	if max <= 3 {
-		return s[:max]
+	tail := "..."
+	if max <= len(tail) {
+		tail = ""
 	}
-	return s[:max-3] + "..."
+	return runewidth.Truncate(s, max, tail)
 }
 
 func formatARPInfo(host hostResult) string {
