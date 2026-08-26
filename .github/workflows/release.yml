@@ -119,6 +119,29 @@ jobs:
             ForEach-Object { "$($_.Hash.ToLower())  ipscry-windows-amd64.zip" } |
             Set-Content dist/ipscry-windows-amd64.zip.sha256
 
+      - name: Publish release artifacts to Azure Blob Storage
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          ACCOUNT: ${{ vars.IPSCRY_BLOB_ACCOUNT || 'imagenetmit' }}
+          CONTAINER: ${{ vars.IPSCRY_BLOB_CONTAINER || 'pub' }}
+          PREFIX: ${{ vars.IPSCRY_BLOB_PREFIX || 'automation/ipscry' }}
+        run: |
+          $uploads = @(
+            @{ File = "dist/ipscry.exe"; Name = "ipscry.exe"; Type = "application/octet-stream" },
+            @{ File = "dist/ipscry.exe.sha256"; Name = "ipscry.exe.sha256"; Type = "text/plain" },
+            @{ File = "dist/ipscry-windows-amd64.zip"; Name = "ipscry-windows-amd64.zip"; Type = "application/zip" },
+            @{ File = "dist/ipscry-windows-amd64.zip.sha256"; Name = "ipscry-windows-amd64.zip.sha256"; Type = "text/plain" },
+            @{ File = "dist/ipscry-linux-amd64"; Name = "ipscry-linux-amd64"; Type = "application/octet-stream" },
+            @{ File = "dist/ipscry-linux-amd64.sha256"; Name = "ipscry-linux-amd64.sha256"; Type = "text/plain" },
+            @{ File = "dist/ipscry-linux-amd64.tar.gz"; Name = "ipscry-linux-amd64.tar.gz"; Type = "application/gzip" },
+            @{ File = "dist/ipscry-linux-amd64.tar.gz.sha256"; Name = "ipscry-linux-amd64.tar.gz.sha256"; Type = "text/plain" }
+          )
+          foreach ($upload in $uploads) {
+            az storage blob upload --account-name $env:ACCOUNT --container-name $env:CONTAINER --name "$env:PREFIX/$($upload.Name)" --file $upload.File --content-type $upload.Type --content-cache "no-cache" --auth-mode login --overwrite true
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload $($upload.Name)" }
+          }
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         if: github.ref_type == 'tag'

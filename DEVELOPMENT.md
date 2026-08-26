@@ -107,6 +107,11 @@ when the required repository secrets are configured. See
 [`CODE_SIGNING.md`](CODE_SIGNING.md) for the complete Azure, OIDC, GitHub
 Environment, and verification setup.
 
+Tagged releases also publish the Windows and Linux artifacts to Azure Blob
+Storage under `automation/ipscry`. Set `IPSCRY_BLOB_ACCOUNT`,
+`IPSCRY_BLOB_CONTAINER`, and `IPSCRY_BLOB_PREFIX` repository variables to
+override the defaults.
+
 ## Pull Requests
 
 1. Create a topic branch from `main`.
