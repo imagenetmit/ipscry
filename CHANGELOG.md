@@ -8,6 +8,13 @@ for tagged releases.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-25
+
+### Added
+
+- Scanning multiple adapter subnets by default and multiple explicit CIDRs from
+  the command line.
+
 ## [0.3.1] - 2026-08-25
 
 ### Added
@@ -77,7 +84,8 @@ for tagged releases.
 - JSON, CSV, and UTC audit log artifacts.
 - Windows build, version metadata, and Authenticode signing helper scripts.
 
-[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/imagenetmit/ipscry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/imagenetmit/ipscry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/imagenetmit/ipscry/compare/v0.1.1...v0.2.0

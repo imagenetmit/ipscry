@@ -41,7 +41,7 @@ Run a scan from PowerShell:
 .\ipscry.exe scan
 ```
 
-With no target, Ipscry scans the active local `/24` network.
+With no target, Ipscry scans every subnet configured on active private IPv4 adapters.
 
 Scan a specific CIDR:
 
@@ -100,11 +100,12 @@ with `--no-tui`.
 ## Common Options
 
 ```text
-ipscry scan [CIDR] [options]
+ipscry [CIDR ...] [options]
 
 Target:
-  no CIDR              scan the active local /24
+  no CIDR              scan every active private IPv4 adapter subnet
   192.168.1.0/24      scan an explicit range
+  CIDR CIDR ...       scan multiple explicit ranges
 
 Output:
   -j, --json PATH      write JSON report

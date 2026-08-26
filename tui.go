@@ -482,11 +482,16 @@ func (t *scanTUI) runPingTick(ctx context.Context) {
 		return
 	}
 
-	_, ipNet, err := net.ParseCIDR(watch.enrich.targetCIDR)
-	if err != nil {
-		return
+	arpByIP := map[string]arpCacheEntry{}
+	for _, target := range watch.enrich.targetCIDRs {
+		_, ipNet, err := net.ParseCIDR(target)
+		if err != nil {
+			continue
+		}
+		for ip, entry := range arpCacheForTarget(ipNet) {
+			arpByIP[ip] = entry
+		}
 	}
-	arpByIP := arpCacheForTarget(ipNet)
 
 	pings := pingSweep(ctx, batch, watchPingTimeout(watch.timeout), tuiWatchPingConcurrency)
 

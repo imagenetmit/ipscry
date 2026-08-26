@@ -167,6 +167,19 @@ func TestParseScanArgsShortConcurrency(t *testing.T) {
 	}
 }
 
+func TestParseScanArgsMultipleCIDRs(t *testing.T) {
+	cfg, err := parseScanArgs([]string{"192.168.1.0/24", "10.0.0.0/24", "--no-tui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Targets) != 2 || cfg.Targets[0] != "192.168.1.0/24" || cfg.Targets[1] != "10.0.0.0/24" {
+		t.Fatalf("targets=%#v", cfg.Targets)
+	}
+	if cfg.Target != "192.168.1.0/24,10.0.0.0/24" {
+		t.Fatalf("target=%q", cfg.Target)
+	}
+}
+
 func TestExpandCIDRSkipsNetworkAndBroadcast(t *testing.T) {
 	ips, err := expandCIDR("192.168.1.0/30")
 	if err != nil {
@@ -730,7 +743,6 @@ func TestParseScanArgsValidation(t *testing.T) {
 		{"zero timeout", []string{"192.168.1.0/24", "--timeout", "0s"}, "timeout"},
 		{"low concurrency", []string{"192.168.1.0/24", "--concurrency", "0"}, "concurrency"},
 		{"high concurrency", []string{"192.168.1.0/24", "--concurrency", "9000"}, "concurrency"},
-		{"two targets", []string{"192.168.1.0/24", "10.0.0.0/24"}, "at most one"},
 		{"bad cidr", []string{"not-a-cidr"}, "invalid target CIDR"},
 	}
 	for _, tc := range cases {
@@ -1386,7 +1398,7 @@ func TestRunHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := out.String()
-	for _, want := range []string{"Usage:", "ipscry [CIDR]", "-h, --help"} {
+	for _, want := range []string{"Usage:", "ipscry [CIDR ...]", "-h, --help"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
 		}

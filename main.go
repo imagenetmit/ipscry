@@ -53,7 +53,7 @@ const (
 // appVersion is overridable at build time:
 //
 //	go build -ldflags "-X main.appVersion=1.2.3"
-var appVersion = "0.3.1"
+var appVersion = "0.3.2"
 
 // portInfo is the single source of truth for a known port: its service label and
 // which application-layer probes apply. Adding a port is a one-line edit here.
@@ -108,6 +108,7 @@ var portCatalog = map[int]portInfo{
 
 type scanConfig struct {
 	Target           string
+	Targets          []string
 	Ports            []int
 	Timeout          time.Duration
 	Concurrency      int
@@ -238,8 +239,10 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 	if cfg.TUI {
-		if err := checkTUINetworkSize(cfg.Target, os.Stdin, stderr); err != nil {
-			return err
+		for _, target := range cfg.Targets {
+			if err := checkTUINetworkSize(target, os.Stdin, stderr); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -253,9 +256,19 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	logger.Printf("scanner=%s version=%s started_at=%s target=%s ports=%s timeout=%s concurrency=%d",
 		appName, appVersion, started.Format(time.RFC3339), cfg.Target, joinInts(cfg.Ports), cfg.Timeout, cfg.Concurrency)
 
-	ips, err := expandCIDR(cfg.Target)
-	if err != nil {
-		return err
+	var ips []string
+	seen := map[string]struct{}{}
+	for _, target := range cfg.Targets {
+		part, err := expandCIDR(target)
+		if err != nil {
+			return err
+		}
+		for _, ip := range part {
+			if _, ok := seen[ip]; !ok {
+				seen[ip] = struct{}{}
+				ips = append(ips, ip)
+			}
+		}
 	}
 	logger.Printf("expanded target=%s ip_count=%d", cfg.Target, len(ips))
 
@@ -302,7 +315,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	enrich := enrichConfig{
 		snmpCommunity: cfg.SNMPCommunity,
 		arpCache:      cfg.ARPCache,
-		targetCIDR:    cfg.Target,
+		targetCIDRs:   cfg.Targets,
 		tuiARPDetail:  cfg.TUIARPDetail,
 		discovery:     discovery,
 	}
@@ -482,21 +495,22 @@ func parseScanArgs(args []string) (scanConfig, error) {
 	}
 
 	switch {
-	case len(positional) > 1:
-		return cfg, errors.New("accept at most one target CIDR")
-	case len(positional) == 1:
-		cfg.Target = positional[0]
+	case len(positional) > 0:
+		cfg.Targets = append([]string(nil), positional...)
+		cfg.Target = strings.Join(cfg.Targets, ",")
 	default:
-		// No target given: scan the active local /24.
-		target, err := localCIDR()
+		targets, err := localCIDRs()
 		if err != nil {
 			return cfg, err
 		}
-		cfg.Target = target
+		cfg.Targets = targets
+		cfg.Target = strings.Join(targets, ",")
 	}
 
-	if _, _, err := net.ParseCIDR(cfg.Target); err != nil {
-		return cfg, fmt.Errorf("invalid target CIDR %q: %w", cfg.Target, err)
+	for _, target := range cfg.Targets {
+		if _, _, err := net.ParseCIDR(target); err != nil {
+			return cfg, fmt.Errorf("invalid target CIDR %q: %w", target, err)
+		}
 	}
 	return cfg, nil
 }
@@ -580,10 +594,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, `%s %s
 
 Usage:
-  ipscry [CIDR] [options]
+  ipscry [CIDR ...] [options]
   ipscry version
 
-With no CIDR, scans the active local /24.
+With no CIDR, scans every active private IPv4 adapter subnet.
+Multiple CIDRs may be supplied to scan selected subnets together.
 
 Options:
   -h, --help
@@ -686,10 +701,20 @@ func configureLog(path string) (*log.Logger, func(), error) {
 }
 
 func localCIDR() (string, error) {
-	ifaces, err := net.Interfaces()
+	targets, err := localCIDRs()
 	if err != nil {
 		return "", err
 	}
+	return targets[0], nil
+}
+
+func localCIDRs() ([]string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	var targets []string
+	seen := map[string]struct{}{}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -703,11 +728,19 @@ func localCIDR() (string, error) {
 			if !ok || !isPrivateIPv4(ip) {
 				continue
 			}
-			ip = ip.To4()
-			return fmt.Sprintf("%d.%d.%d.0/24", ip[0], ip[1], ip[2]), nil
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				target := ipNet.String()
+				if _, exists := seen[target]; !exists {
+					seen[target] = struct{}{}
+					targets = append(targets, target)
+				}
+			}
 		}
 	}
-	return "", errors.New("no active private IPv4 adapter found; provide an explicit CIDR")
+	if len(targets) == 0 {
+		return nil, errors.New("no active private IPv4 adapter found; provide an explicit CIDR")
+	}
+	return targets, nil
 }
 
 func ipv4FromAddr(addr net.Addr) (net.IP, bool) {
@@ -849,14 +882,16 @@ func arpCacheForTarget(ipNet *net.IPNet) map[string]arpCacheEntry {
 	return out
 }
 
-func arpCacheEntryForIP(ip, targetCIDR string) (arpCacheEntry, bool) {
-	_, ipNet, err := net.ParseCIDR(targetCIDR)
-	if err != nil || !ipInTarget(ip, ipNet) {
-		return arpCacheEntry{}, false
-	}
-	for _, entry := range arpCacheEntries() {
-		if entry.IP == ip && validARPMAC(entry.MAC) {
-			return entry, true
+func arpCacheEntryForIP(ip string, targetCIDRs []string) (arpCacheEntry, bool) {
+	for _, targetCIDR := range targetCIDRs {
+		_, ipNet, err := net.ParseCIDR(targetCIDR)
+		if err != nil || !ipInTarget(ip, ipNet) {
+			continue
+		}
+		for _, entry := range arpCacheEntries() {
+			if entry.IP == ip && validARPMAC(entry.MAC) {
+				return entry, true
+			}
 		}
 	}
 	return arpCacheEntry{}, false
@@ -918,7 +953,7 @@ func incIP(ip net.IP) {
 type enrichConfig struct {
 	snmpCommunity string
 	arpCache      bool
-	targetCIDR    string
+	targetCIDRs   []string
 	tuiARPDetail  bool
 	discovery     discoveryConfig
 }
@@ -992,7 +1027,12 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 		discoveryWg.Add(1)
 		go func() {
 			defer discoveryWg.Done()
-			discoveryHits = runLANDiscovery(ctx, enrich.targetCIDR, enrich.discovery, logger)
+			discoveryHits = map[string]discoveryHit{}
+			for _, target := range enrich.targetCIDRs {
+				for ip, hit := range runLANDiscovery(ctx, target, enrich.discovery, logger) {
+					discoveryHits[ip] = hit
+				}
+			}
 		}()
 	}
 
@@ -1015,14 +1055,25 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	}
 	discoveryWg.Wait()
 
-	_, ipNet, err := net.ParseCIDR(enrich.targetCIDR)
-	if err != nil {
-		return nil
+	ipNets := make([]*net.IPNet, 0, len(enrich.targetCIDRs))
+	for _, target := range enrich.targetCIDRs {
+		_, ipNet, err := net.ParseCIDR(target)
+		if err != nil {
+			return nil
+		}
+		ipNets = append(ipNets, ipNet)
 	}
 	if discoveryHits != nil {
-		mergeDiscoveryHosts(byIP, discoveryHits, ipNet)
+		for _, ipNet := range ipNets {
+			mergeDiscoveryHosts(byIP, discoveryHits, ipNet)
+		}
 	}
-	arpByIP := arpCacheForTarget(ipNet)
+	arpByIP := map[string]arpCacheEntry{}
+	for _, ipNet := range ipNets {
+		for ip, entry := range arpCacheForTarget(ipNet) {
+			arpByIP[ip] = entry
+		}
+	}
 	arpDeadByIP := map[string]arpCacheEntry{}
 	if enrich.arpCache {
 		liveIPs := make(map[string]struct{}, len(byIP))
@@ -1174,7 +1225,7 @@ func enrichHost(ctx context.Context, ip string, openPorts []portResult, enrich e
 		Status:     status,
 	}
 	applyDiscoveryFields(&host, hit)
-	fillARPFromCache(&host, enrich.targetCIDR)
+	fillARPFromCache(&host, enrich.targetCIDRs)
 	return host
 }
 
@@ -2563,8 +2614,8 @@ func applyARPFromCache(host *hostResult, entry arpCacheEntry) {
 	}
 }
 
-func fillARPFromCache(host *hostResult, targetCIDR string) {
-	entry, ok := arpCacheEntryForIP(host.IP, targetCIDR)
+func fillARPFromCache(host *hostResult, targetCIDRs []string) {
+	entry, ok := arpCacheEntryForIP(host.IP, targetCIDRs)
 	if !ok {
 		return
 	}
