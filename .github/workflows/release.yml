@@ -46,7 +46,7 @@ jobs:
           sha256sum ipscry-linux-amd64.tar.gz > ipscry-linux-amd64.tar.gz.sha256
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ipscry-linux-amd64
           path: |
@@ -71,7 +71,7 @@ jobs:
           check-latest: true
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ipscry-linux-amd64
           path: dist
