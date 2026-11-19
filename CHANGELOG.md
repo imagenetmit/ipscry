@@ -8,6 +8,27 @@ for tagged releases.
 
 ## [Unreleased]
 
+### Added
+
+- HTTP(S) page retrieval on every web port in the default scan set (81–89,
+  3000, 5000, 8081, 8888, 9000, 9443, 10000 and the rest), not just the eight
+  hardcoded ones, plus Docker, Kibana, Kubernetes API, WebLogic and
+  Elasticsearch ports.
+- Second-pass HTTP/HTTPS detection on open ports that are in neither port
+  table (for example ports given with `--ports`). Ports that send a banner are
+  left alone, and known non-web ports are never sent a request.
+
+### Fixed
+
+- HTTPS on alternate ports (4443, 5443, 9443, ...) was probed as plain HTTP.
+  The scheme now follows the port data, and a probe that reaches the wrong
+  scheme retries with the other one.
+- Open ports on printers and other small devices went missing at random
+  because each host's ports were all checked at once and the device dropped
+  part of the burst. The scan now goes port by port across hosts and runs at
+  most 8 checks against any one host at a time. Scanning a single dead host
+  takes about 3 s instead of under 1 s as a result.
+
 ## [0.3.2] - 2026-08-25
 
 ### Added
