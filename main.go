@@ -104,6 +104,13 @@ var portCatalog = map[int]portInfo{
 	5061: {service: "sips", tls: true},
 	5985: {service: "winrm"},
 	5986: {service: "winrm-https", tls: true},
+	// Web APIs and consoles whose ports.csv label does not say "HTTP".
+	2375: {service: "docker", http: true},
+	2376: {service: "docker-tls", http: true, tls: true},
+	5601: {service: "kibana", http: true},
+	6443: {service: "kubernetes-api", http: true, tls: true},
+	7001: {service: "weblogic", http: true},
+	9200: {service: "elasticsearch", http: true},
 }
 
 type scanConfig struct {
@@ -972,13 +979,17 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	total := int64(len(ips) * len(ports))
 	var scanned int64
 
+	hostSlots := newHostLimiter(perHostScanLimit)
 	var workers sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for j := range jobs {
-				if result, ok := scanPort(ctx, j.ip, j.port, timeout); ok {
+				release := hostSlots.acquire(j.ip)
+				result, ok := scanPort(ctx, j.ip, j.port, timeout)
+				release()
+				if ok {
 					results <- result
 				}
 				atomic.AddInt64(&scanned, 1)
@@ -987,11 +998,9 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	}
 
 	go func() {
-		for _, ip := range ips {
-			for _, port := range ports {
-				jobs <- job{ip: ip, port: port}
-			}
-		}
+		forEachScanJob(ips, ports, func(ip string, port int) {
+			jobs <- job{ip: ip, port: port}
+		})
 		close(jobs)
 		workers.Wait()
 		close(results)
@@ -1131,9 +1140,58 @@ func scanNetwork(ctx context.Context, ips []string, ports []int, timeout time.Du
 	return hosts
 }
 
+// forEachScanJob visits every (ip, port) pair port by port: port 1 on every
+// host, then port 2 on every host, and so on. Ordered host by host instead,
+// the worker pool would send all of one host's ports within a few
+// milliseconds, and small embedded stacks (printers, cameras) silently drop
+// part of such a burst, so open ports go missing at random. Interleaving
+// spreads each host's connections across the whole scan at no cost in total
+// time.
+func forEachScanJob(ips []string, ports []int, visit func(ip string, port int)) {
+	for _, port := range ports {
+		for _, ip := range ips {
+			visit(ip, port)
+		}
+	}
+}
+
+// perHostScanLimit caps how many port checks run against one host at a time.
+// Interleaving (forEachScanJob) already keeps this low on large scans; the cap
+// matters when only a few hosts are scanned, where the worker pool would
+// otherwise send every port to the same device at once and lose some of them.
+const perHostScanLimit = 8
+
+// hostLimiter hands out per-host slots, creating each host's slot set on first
+// use so a large target range does not allocate one up front for every IP.
+type hostLimiter struct {
+	limit int
+	mu    sync.Mutex
+	slots map[string]chan struct{}
+}
+
+func newHostLimiter(limit int) *hostLimiter {
+	return &hostLimiter{limit: limit, slots: map[string]chan struct{}{}}
+}
+
+// acquire blocks until ip has a free slot and returns the func that frees it.
+func (h *hostLimiter) acquire(ip string) func() {
+	h.mu.Lock()
+	ch, ok := h.slots[ip]
+	if !ok {
+		ch = make(chan struct{}, h.limit)
+		h.slots[ip] = ch
+	}
+	h.mu.Unlock()
+	ch <- struct{}{}
+	return func() { <-ch }
+}
+
 func scanIPPorts(ctx context.Context, ip string, ports []int, timeout time.Duration, concurrency int) []portResult {
 	if concurrency < 1 {
 		concurrency = 1
+	}
+	if concurrency > perHostScanLimit {
+		concurrency = perHostScanLimit
 	}
 	var mu sync.Mutex
 	var open []portResult
@@ -1313,18 +1371,26 @@ func scanPort(ctx context.Context, ip string, port int, timeout time.Duration) (
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	info := portCatalog[port]
+	info := portProbeInfo(port)
 	pr := portResult{Port: port, Service: serviceLabel(port), Vendors: portVendors(port)}
 
-	// HTTP ports: the HTTP client performs its own dial. A response (any status)
-	// proves the port is open and yields the richest metadata in one round-trip.
+	// HTTP ports: connect first and fetch the page only when the port is open.
+	// Letting the HTTP client dial would cost a closed or filtered port two
+	// timeouts (the HTTP attempt plus the TCP fallback), which across the ~40
+	// web ports in the default set doubles the scan time. If the page fetch
+	// fails, the port is still reported open and the second pass retries it.
 	if info.http {
+		addr := net.JoinHostPort(ip, strconv.Itoa(port))
+		dialer := net.Dialer{Timeout: timeout}
 		start := time.Now()
-		if probeHTTP(ctx, ip, port, timeout, &pr) {
-			return portScanResult{ip: ip, port: pr, latencyMS: time.Since(start).Milliseconds()}, true
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return portScanResult{}, false
 		}
-		// Probe failed; pr.ProbeError is retained and we fall through to a plain
-		// TCP check so an open-but-not-HTTP port is still reported.
+		latencyMS := time.Since(start).Milliseconds()
+		conn.Close()
+		probeHTTP(ctx, ip, port, timeout, &pr)
+		return portScanResult{ip: ip, port: pr, latencyMS: latencyMS}, true
 	}
 
 	// TLS-only ports: dial with TLS directly so the single connection both proves
@@ -1357,11 +1423,51 @@ func scanPort(ctx context.Context, ip string, port int, timeout time.Duration) (
 	return portScanResult{ip: ip, port: pr, latencyMS: latencyMS}, true
 }
 
+// probeHTTP fetches "/" from a web port and records status, server, redirect,
+// title and certificate subject. The scheme comes from the port's tls flag; if
+// the server turns out to speak the other scheme, the probe retries once with
+// it, so a mislabelled port (an HTTPS console on 5000, say) is still read.
 func probeHTTP(ctx context.Context, ip string, port int, timeout time.Duration, pr *portResult) bool {
-	scheme := "http"
-	if port == 443 || port == 8443 {
-		scheme = "https"
+	first, second := "http", "https"
+	if portProbeInfo(port).tls {
+		first, second = "https", "http"
 	}
+	if probeHTTPScheme(ctx, ip, port, first, timeout, pr) {
+		return true
+	}
+	if !wrongHTTPScheme(pr.ProbeError) {
+		return false
+	}
+	return probeHTTPScheme(ctx, ip, port, second, timeout, pr)
+}
+
+// wrongHTTPScheme reports whether a probe error means the server speaks the
+// other scheme: plain HTTP sent to a TLS server reads back the TLS alert record
+// (starts 0x15 0x03), and TLS sent to a plain server gets an HTTP response.
+func wrongHTTPScheme(errText string) bool {
+	return strings.Contains(errText, "HTTP response to HTTPS client") ||
+		strings.Contains(errText, `malformed HTTP response "\x15\x03`) ||
+		strings.Contains(errText, "first record does not look like a TLS handshake")
+}
+
+// probeHTTPScheme fetches "/" with the given scheme. Many TLS servers answer a
+// plaintext request with a 400 page saying HTTPS is required (Go, nginx); when
+// that happens the page is fetched again over HTTPS and that result is kept if
+// it succeeds, so the record shows the real page rather than the error.
+func probeHTTPScheme(ctx context.Context, ip string, port int, scheme string, timeout time.Duration, pr *portResult) bool {
+	ok, httpsOnly := fetchHTTP(ctx, ip, port, scheme, timeout, pr)
+	if ok && httpsOnly && scheme == "http" {
+		alt := portResult{Port: pr.Port, Service: pr.Service, Vendors: pr.Vendors, Banner: pr.Banner}
+		if altOK, _ := fetchHTTP(ctx, ip, port, "https", timeout, &alt); altOK {
+			*pr = alt
+		}
+	}
+	return ok
+}
+
+// fetchHTTP does one GET and fills pr. httpsOnly reports a 400 reply whose body
+// mentions HTTPS, the usual answer of a TLS port to a plaintext request.
+func fetchHTTP(ctx context.Context, ip string, port int, scheme string, timeout time.Duration, pr *portResult) (ok, httpsOnly bool) {
 	url := fmt.Sprintf("%s://%s/", scheme, net.JoinHostPort(ip, strconv.Itoa(port)))
 	client := http.Client{
 		Timeout: timeout,
@@ -1376,13 +1482,13 @@ func probeHTTP(ctx context.Context, ip string, port int, timeout time.Duration, 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		pr.ProbeError = err.Error()
-		return false
+		return false, false
 	}
 	req.Header.Set("User-Agent", "ipscry/"+appVersion)
 	resp, err := client.Do(req)
 	if err != nil {
 		pr.ProbeError = sanitizeOneLine(err.Error())
-		return false
+		return false, false
 	}
 	defer resp.Body.Close()
 	pr.HTTPStatus = resp.Status
@@ -1402,15 +1508,16 @@ func probeHTTP(ctx context.Context, ip string, port int, timeout time.Duration, 
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	pr.HTTPTitle = extractTitle(string(body))
-	return true
+	httpsOnly = resp.StatusCode == http.StatusBadRequest &&
+		strings.Contains(strings.ToLower(string(body)), "https")
+	return true, httpsOnly
 }
 
 // portNeedsHTTPProbe reports whether an open web port still lacks an HTTP
 // response, meaning the short connect-timeout probe timed out before any page
 // info could be collected. These ports get a longer second pass.
 func portNeedsHTTPProbe(pr portResult) bool {
-	info, ok := portCatalog[pr.Port]
-	return ok && info.http && pr.HTTPStatus == ""
+	return portProbeInfo(pr.Port).http && pr.HTTPStatus == ""
 }
 
 // deepProbeHTTPPort re-runs the HTTP(S) page retrieval against an already-open
@@ -1424,8 +1531,111 @@ func deepProbeHTTPPort(ctx context.Context, ip string, pr portResult, timeout ti
 		Vendors: pr.Vendors,
 		Banner:  pr.Banner,
 	}
-	probeHTTP(ctx, ip, pr.Port, timeout, &out)
+	if portProbeInfo(pr.Port).http {
+		probeHTTP(ctx, ip, pr.Port, timeout, &out)
+	} else {
+		sniffHTTP(ctx, ip, pr.Port, timeout, &out)
+	}
 	return out
+}
+
+// portNeedsHTTPSniff reports whether an open port is in neither port table and
+// showed no banner, so it may be an unlisted web server (a vendor console on a
+// port passed via --ports). Known ports are never sniffed: sending a GET to a
+// raw printer port or a database is noise at best.
+func portNeedsHTTPSniff(pr portResult) bool {
+	return !portIsKnown(pr.Port) && pr.Banner == "" && pr.HTTPStatus == ""
+}
+
+// httpSniffBannerWait is how long sniffHTTP waits for a server-speaks-first
+// banner before sending its own request.
+const httpSniffBannerWait = 300 * time.Millisecond
+
+type sniffVerdict int
+
+const (
+	sniffNone sniffVerdict = iota
+	sniffBanner
+	sniffPlainHTTP
+	sniffMaybeTLS
+)
+
+// sniffHTTP works out whether an unknown open port speaks HTTP or HTTPS and,
+// if so, fills in the page metadata. It first waits briefly for a banner (a
+// service that talks first is not HTTP), then sends a minimal GET: an "HTTP/"
+// reply means plain HTTP; a TLS alert, a silent wait or a dropped connection
+// means it may be TLS, which is then tried as HTTPS.
+func sniffHTTP(ctx context.Context, ip string, port int, timeout time.Duration, pr *portResult) bool {
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		pr.ProbeError = sanitizeOneLine(err.Error())
+		return false
+	}
+	verdict, data := sniffConn(conn, ip, port, timeout)
+	conn.Close()
+
+	scheme := ""
+	switch verdict {
+	case sniffBanner:
+		pr.Banner = sanitizeOneLine(data)
+		return false
+	case sniffPlainHTTP:
+		scheme = "http"
+	case sniffMaybeTLS:
+		scheme = "https"
+	default:
+		return false
+	}
+	if !probeHTTPScheme(ctx, ip, port, scheme, timeout, pr) {
+		return false
+	}
+	if pr.Service == "" || pr.Service == "unknown" {
+		// probeHTTPScheme may have moved a plaintext probe over to HTTPS.
+		pr.Service = "http"
+		if pr.TLSSubject != "" {
+			pr.Service = "https"
+		}
+	}
+	return true
+}
+
+func sniffConn(conn net.Conn, ip string, port int, timeout time.Duration) (sniffVerdict, string) {
+	buf := make([]byte, 256)
+
+	_ = conn.SetReadDeadline(time.Now().Add(minDuration(timeout, httpSniffBannerWait)))
+	n, err := conn.Read(buf)
+	if n > 0 {
+		if strings.HasPrefix(string(buf[:n]), "HTTP/") {
+			return sniffPlainHTTP, ""
+		}
+		return sniffBanner, string(buf[:n])
+	}
+	if !isTimeout(err) {
+		return sniffNone, "" // closed before we spoke: nothing to learn
+	}
+
+	req := fmt.Sprintf("GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: ipscry/%s\r\nAccept: */*\r\n\r\n",
+		net.JoinHostPort(ip, strconv.Itoa(port)), appVersion)
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return sniffNone, ""
+	}
+	n, _ = io.ReadAtLeast(conn, buf, 5)
+	switch {
+	case n >= 5 && string(buf[:5]) == "HTTP/":
+		return sniffPlainHTTP, ""
+	case n >= 2 && buf[0] == 0x15 && buf[1] == 0x03:
+		return sniffMaybeTLS, "" // TLS alert record in reply to plaintext
+	case n == 0:
+		return sniffMaybeTLS, "" // silent or dropped: TLS servers do either
+	}
+	return sniffNone, "" // answered, but not in HTTP
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // runDeepHTTPProbe schedules second-pass HTTP/HTTPS page retrievals for every
@@ -1446,7 +1656,7 @@ func runDeepHTTPProbe(ctx context.Context, hosts []hostResult, timeout time.Dura
 	var jobs []httpJob
 	for i := range hosts {
 		for j := range hosts[i].OpenPorts {
-			if portNeedsHTTPProbe(hosts[i].OpenPorts[j]) {
+			if p := hosts[i].OpenPorts[j]; portNeedsHTTPProbe(p) || portNeedsHTTPSniff(p) {
 				jobs = append(jobs, httpJob{i, j, hosts[i].IP, hosts[i].OpenPorts[j]})
 			}
 		}

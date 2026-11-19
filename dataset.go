@@ -118,6 +118,34 @@ func serviceLabel(port int) string {
 	return "unknown"
 }
 
+// portProbeInfo returns how to probe a port. A portCatalog entry wins; otherwise
+// the embedded ports.csv service name decides, so every "HTTP ..." row gets an
+// HTTP probe and every "HTTPS ..." row gets an HTTPS probe. Ports in neither
+// table return the zero value (plain TCP connect).
+func portProbeInfo(port int) portInfo {
+	if info, ok := portCatalog[port]; ok {
+		return info
+	}
+	e, ok := portsByNumber[port]
+	if !ok {
+		return portInfo{}
+	}
+	return portInfo{
+		service: e.service,
+		http:    strings.Contains(e.service, "http"),
+		tls:     strings.Contains(e.service, "https"),
+	}
+}
+
+// portIsKnown reports whether the port appears in either port table.
+func portIsKnown(port int) bool {
+	if _, ok := portCatalog[port]; ok {
+		return true
+	}
+	_, ok := portsByNumber[port]
+	return ok
+}
+
 // portVendors returns common software/products for a known port, or "".
 func portVendors(port int) string {
 	if e, ok := portsByNumber[port]; ok {
