@@ -53,7 +53,7 @@ const (
 // appVersion is overridable at build time:
 //
 //	go build -ldflags "-X main.appVersion=1.2.3"
-var appVersion = "0.3.2"
+var appVersion = "0.4.0"
 
 // portInfo is the single source of truth for a known port: its service label and
 // which application-layer probes apply. Adding a port is a one-line edit here.

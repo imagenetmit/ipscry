@@ -8,6 +8,8 @@ for tagged releases.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-19
+
 ### Added
 
 - HTTP(S) page retrieval on every web port in the default scan set (81–89,
@@ -28,6 +30,18 @@ for tagged releases.
   part of the burst. The scan now goes port by port across hosts and runs at
   most 8 checks against any one host at a time. Scanning a single dead host
   takes about 3 s instead of under 1 s as a result.
+
+### Security
+
+- CI and release builds use Go 1.26.11, which fixes standard-library
+  vulnerabilities in `net/http`, `crypto/tls`, `crypto/x509` and
+  `net/textproto` reported by govulncheck against Go 1.26.6.
+
+## [0.3.3] - 2026-08-26
+
+### Changed
+
+- Release builds use Go 1.26.6.
 
 ## [0.3.2] - 2026-08-25
 
@@ -105,7 +119,9 @@ for tagged releases.
 - JSON, CSV, and UTC audit log artifacts.
 - Windows build, version metadata, and Authenticode signing helper scripts.
 
-[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/imagenetmit/ipscry/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/imagenetmit/ipscry/compare/v0.3.3...v0.4.0
+[0.3.3]: https://github.com/imagenetmit/ipscry/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/imagenetmit/ipscry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/imagenetmit/ipscry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/imagenetmit/ipscry/compare/v0.2.0...v0.3.0
